@@ -1,0 +1,13 @@
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+*.pyo
+*.egg-info/
+catboost_info/
+dist/
+build/
+data/
+!data/.gitkeep
+notebooks/.ipynb_checkpoints/
+.ipynb_checkpoints

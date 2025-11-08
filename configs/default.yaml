@@ -1,0 +1,28 @@
+experiment_name: baseline_logreg
+dataset:
+  name: iris
+  test_size: 0.2
+  random_state: 42
+preprocessing:
+  impute_strategy: mean
+  scale: true
+model:
+  type: logistic_regression
+  params:
+    penalty: l2
+    C: 1.0
+    solver: lbfgs
+    max_iter: 200
+training:
+  use_class_weight: false
+  scoring: accuracy
+  cross_validation:
+    enabled: true
+    folds: 5
+evaluation:
+  metrics:
+    - accuracy
+    - f1_macro
+outputs:
+  model_dir: artifacts/models
+  reports_dir: artifacts/reports

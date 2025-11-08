@@ -1,0 +1,49 @@
+# ---- 全域規則：預設文字檔都用 LF（最重要）----
+* text eol=lf
+
+# ---- 程式與設定（明確指定）----
+*.py      text eol=lf
+*.ipynb   text eol=lf
+*.json    text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+*.txt     text eol=lf
+*.csv     text eol=lf
+*.tsv     text eol=lf
+*.ini     text eol=lf
+*.cfg     text eol=lf
+*.sh      text eol=lf
+Dockerfile text eol=lf
+*.dockerfile text eol=lf
+
+# ---- 僅限 Windows 批次檔保留 CRLF（如果你需要 .bat/.cmd）----
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+
+# ---- 二進位或大型檔（避免換行處理）----
+*.png     -text
+*.jpg     -text
+*.jpeg    -text
+*.gif     -text
+*.svg     -text
+*.pdf     -text
+*.zip     -text
+*.7z      -text
+*.gz      -text
+*.bz2     -text
+*.xz      -text
+*.tar     -text
+*.pkl     -text
+*.pt      -text
+*.npy     -text
+*.npz     -text
+*.parquet -text
+*.feather -text
+*.xlsx    -text
+*.xls     -text
+*.exe     -text
+*.dll     -text
+*.so      -text
+*.dylib   -text
