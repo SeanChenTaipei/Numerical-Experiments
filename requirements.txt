@@ -11,3 +11,4 @@ catboost>=1.2.5
 torch>=2.3.0
 pytorch-lightning>=2.2.0
 matplotlib>=3.8.0
+rich>=14.0.0

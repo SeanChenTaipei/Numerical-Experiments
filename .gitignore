@@ -11,3 +11,15 @@ data/
 !data/.gitkeep
 notebooks/.ipynb_checkpoints/
 .ipynb_checkpoints
+
+# Training artifacts
+artifacts/
+checkpoints/
+notebooks/checkpoints/
+notebooks/lightning_logs/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.joblib
