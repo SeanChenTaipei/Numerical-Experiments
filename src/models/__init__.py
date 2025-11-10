@@ -1,5 +1,10 @@
 """Model package exports."""
 
-from .mixed_gam import MixedGAMRegressor, MixedGAMConfig
+from .mixed_gam import (ConditionalSNNRegressor, MixedGAMConfig,
+                        MixedGAMRegressor)
 
-__all__ = ["MixedGAMRegressor", "MixedGAMConfig"]
+__all__ = [
+    "MixedGAMRegressor",
+    "ConditionalSNNRegressor",
+    "MixedGAMConfig",
+]
