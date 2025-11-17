@@ -1,100 +1,108 @@
-# Machine Learning Pipeline Starter
+# Temporal Group Regression Lab
 
-This repository provides a lightweight, opinionated starting point for applied machine learning research. It includes:
+A fully-operational Python + Streamlit toolkit for tabular regression problems that simultaneously exhibit **temporal structure** (timestamps) and **group structure** (machines, batches, SKUs). The app loads CSV/Feather files (or auto-generates realistic synthetic data), performs time-aware preprocessing, builds LightGBM/CatBoost/EBM models, evaluates drift & ICC stability, scores single features with shallow decision trees, and exposes an extensible probe-based EDA playbook.
 
-- Structured source layout under `src/` with data ingestion, preprocessing, model definition, and training orchestration modules.
-- Configuration-first workflow using YAML files for experiment reproducibility.
-- Experiment tracking stubs and testing harness to keep research iterations reliable.
+## Key Capabilities
+
+- **Unified configuration** via configs/default.yaml + optional overrides. Centralizes timestamp/group/factor columns, preprocessing strategy, drift & ICC settings, and Streamlit defaults.
+- **Factory-driven architecture** (DataLoaderFactory, ModelTrainerFactory, ProbeRegistry) wrapped under src/timeseries_lab/ modules (data_io, split, preprocess, drift, icc, 	ree_score, probe, iz, utils).
+- **Caching everywhere it matters**: Streamlit @st.cache_data/@st.cache_resource guard dataset loading, splits, preprocessing, drift tables, ICC summaries, tree scores, and probe payloads (cache keys include hashes of config + data).
+- **Temporal splits & coverage reports** supporting ratio/date modes plus group coverage sanity checks.
+- **Modeling suite** with expanding-window CV, RMSE/MAE/R2/MedAE metrics, permutation importances, and Top-K Jaccard stability tracking.
+- **Comprehensive monitoring**: PSI/KS/CVM/JS/TV/Wasserstein drift metrics, ICC(1/2/3) stability, residual heatmaps, and Tree Score radar/bars. High-drift/high-impact features are auto-flagged.
+- **Probe-based EDA Playbook** (6 pre-built probes) returning titles, markdown summaries, tables, Plotly figs, and tags that can be exported to Markdown/HTML reports.
+- **Artifacts**: 10+ Plotly visualizations auto-saved under rtifacts/plots/ on import, plus report downloads (JSON + Markdown) from the Streamlit UI.
+
+## Project Layout
+
+`
+app.py                              # Streamlit entrypoint with 8 tabs + sidebar controls
+configs/default.yaml                # Central configuration (overridable via configs/experiment.yaml)
+src/timeseries_lab/
+  ¢u¢w¢w data_io.py                    # File loaders + synthetic generator
+  ¢u¢w¢w split.py                      # TimeSplitService + SplitResult dataclass
+  ¢u¢w¢w preprocess.py                 # Target encoding, VIF filtering, RobustScaler pipeline
+  ¢u¢w¢w modeling.py                   # ModelTrainerFactory + expanding-window CV orchestration
+  ¢u¢w¢w drift.py                      # DriftAnalyzer for PSI/KS/CVM/Wasserstein/JS/TV
+  ¢u¢w¢w icc.py                        # ICCAnalyzer with pingouin fallback + summaries
+  ¢u¢w¢w tree_score.py                 # Shallow decision-tree feature scoring
+  ¢u¢w¢w probe.py                      # Probe registry/decorator + 6 built-in probes
+  ¢u¢w¢w viz.py                        # Plotly helpers + artifact bootstrapper (10+ plots saved)
+  ¢u¢w¢w utils.py                      # Hashing, sampling, coverage helpers
+  ¢|¢w¢w settings.py                   # Config loading facade + artifact path helpers
+artifacts/plots/                    # Auto-generated Plotly HTML figures
+requirements.txt                    # Version-bounded dependencies (Streamlit, Plotly, LGBM, CatBoost, EBM, etc.)
+tests/                              # Split/Drift/ICC/Tree Score unit tests
+`
 
 ## Getting Started
 
-1. **Create a virtual environment**
+1. **Environment**
 
-   ```bash
+   `ash
    python -m venv .venv
-   source .venv/bin/activate  # Windows: .venv\Scripts\activate
-   ```
-
-2. **Install dependencies**
-
-   ```bash
+   .venv\Scripts\activate   # Windows
    pip install --upgrade pip
    pip install -r requirements.txt
-   ```
+   `
 
-3. **Train a model with the default configuration**
+2. **Run the Streamlit Lab**
 
-   ```bash
-   python -m src.pipeline.train --config configs/default.yaml
-   ```
+   `ash
+   streamlit run app.py
+   `
 
-4. **Run the unit test suite**
+   - Use the sidebar to upload df_data / df_factors or rely on the built-in synthetic generator.
+   - Select target/group/timestamp columns, tweak split mode (ratio/date), drift thresholds, model choice, ICC/drift settings, and probe parameters.
+   - Every heavy computation is cached; use the ¡§Clear cache¡¨ button if you change upstream files/configs.
 
-   ```bash
+3. **Artifacts & Reports**
+
+   - All charts have associated download buttons; HTML copies also live under rtifacts/plots/.
+   - The ¡§Reports & Artifacts¡¨ tab exports a consolidated JSON + Markdown summary (metrics, drift alerts, ICC status, probe highlights).
+
+4. **Unit Tests**
+
+   `ash
    pytest
-   ```
+   `
 
-## Repository Layout
+## Configuration Notes
 
-```
-â”œâ”€â”€ configs/            # Experiment and data settings
-â”œâ”€â”€ data/               # Local datasets (ignored by git)
-â”œâ”€â”€ notebooks/          # Research notebooks
-â”œâ”€â”€ src/                # Reusable pipeline code
-â”œâ”€â”€ tests/              # Unit tests for the pipeline
-â””â”€â”€ requirements.txt    # Python dependencies
-```
+- Override defaults by editing configs/experiment.yaml or pointing EXPERIMENT_CONFIG to another YAML.
+- Key sections:
+  - data.defaults: timestamp/group/target/factor column names.
+  - preprocess: target encoding folds, VIF threshold, missingness cap.
+  - modeling: per-model hyperparameters + CV settings.
+  - drift / icc / 	ree_score: risk thresholds and scoring knobs.
+  - probes: binning cadence + Top-N controls for the EDA playbook.
 
-## Configuration System
+## Generating Synthetic Data on Disk
 
-Configurations are stored as YAML files inside `configs/` and loaded via `OmegaConf`. Each configuration file should define the dataset, preprocessing choices, model hyperparameters, and training options. Copy `configs/default.yaml` to create new experiments.
+Run the helper below to persist the default synthetic dataset (optional):
 
-## Next Steps
+`ash
+python - <<"PY"
+from pathlib import Path
+from timeseries_lab.data_io import DataLoaderFactory
+bundle = DataLoaderFactory.fallback_synthetic(rows=5000, groups=12)
+bundle.df_data.to_csv("data/synthetic_data.csv", index=False)
+bundle.df_factors.to_csv("data/synthetic_factors.csv", index=False)
+PY
+`
 
-- Add new datasets by extending `src/pipeline/data.py`.
-- Introduce experiment logging (e.g., MLflow, Weights & Biases) via the hook in `src/pipeline/train.py`.
-- Replace the baseline scikit-learn model with bespoke architectures or AutoML tools as needed.
+## Testing & Quality
 
-## MixedGAM Utilities
+- 	ests/test_split.py: verifies chronological ratio splitting & coverage integrity.
+- 	ests/test_drift.py: ensures drift metrics & risk annotations are present.
+- 	ests/test_icc.py: validates ICC table construction.
+- 	ests/test_tree_score.py: checks shallow-tree scoring outputs.
 
-### Ray Tune Auto Search
+## Design Patterns & Extensibility
 
-`MixedGAMRegressor` now defers to Ray Tune when `auto_search=True`. You can let the built-in search space run or provide a Ray-compatible `search_space` dictionary (e.g., `{"learning_rate": tune.loguniform(...), "n_epochs": tune.choice([...])}`). The search summary exposes the best config/metric, while the actual model instance is updated in-place with the chosen hyper-parameters.
+- **Factory Pattern**: DataLoaderFactory picks CSV/Feather/Synthetic loaders; ModelTrainerFactory instantiates LightGBM/CatBoost/EBM trainers.
+- **Registry Pattern**: ProbeRegistry uses decorators to register probes, making it trivial to add new investigative recipes.
+- **Dependency Injection**: Config dictionaries flow through each service (split, preprocessing, drift, ICC, tree score) enabling reproducible overrides and straightforward unit tests.
+- **Caching Strategy**: hash_pandas_frame + config hashes guarantee cache keys reflect both data and settings; clearing caches is a single click from the UI.
 
-### Validation Splits, Callbacks, and Progress
-
-The `fit` signature accepts optional validation arrays or a `val_ratio`:
-
-```python
-model.fit(
-    X_train,
-    y_train,
-    groups=group_labels,
-    X_val=X_valid,
-    y_val=y_valid,
-    groups_val=g_valid,
-    callbacks=[pl.callbacks.EarlyStopping(monitor="val_loss")],
-)
-```
-
-If no validation data is supplied, the trainer performs a stratified split using `val_ratio` (default `0.2`). During training the Lightning progress bar is always visible and now highlights the current mode, running train/val losses, and optimizer learning rate so long runs stay informative.
-
-### Inspecting Feature Contributions
-
-`predict_and_contrib` returns both predictions and a dictionary of additive pieces:
-
-```python
-preds, contribs = model.predict_and_contrib(X_test, groups=g_test)
-base = contribs["base_per_feature"]      # per-feature global trunk output
-bias = contribs["bias"]                  # broadcast scalar bias
-
-if model.mode == "group_residual":
-    residual = contribs["residual_per_feature"]
-    per_feature = contribs["per_feature"]    # base + residual per feature
-    residual_sum = contribs["residual_sum"]  # per-sample adapter total
-else:  # group_affine
-    before_affine = contribs["base_per_feature"]
-    after_affine = contribs["per_feature"]   # values after affine adapters
-```
-
-Use these arrays to plot shape functions, audit per-group adjustments, or feed into downstream explanation tooling.
+Happy analyzing! ??

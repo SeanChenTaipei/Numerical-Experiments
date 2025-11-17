@@ -1,0 +1,17 @@
+experiment:
+  name: experiment_override
+  description: Example override toggling drift sensitivity and tree depth
+
+drift:
+  thresholds:
+    psi: 0.15
+    ks: 0.18
+    wasserstein: 0.6
+
+tree_score:
+  max_depth: 2
+  min_samples_leaf: 25
+
+modeling:
+  cv:
+    n_folds: 5

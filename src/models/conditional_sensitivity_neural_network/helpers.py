@@ -38,7 +38,18 @@ def _make_layer_norm(norm_type: str,
 
 
 class FeatureMLP(nn.Module):
-    """Tiny per-feature MLP used by the additive base learner."""
+    """Tiny per-feature MLP used by the additive base learner.
+
+    Args:
+        hidden_units: Layer widths for the 1D tower.
+        activation: Non-linearity name.
+        dropout: Dropout rate applied between hidden layers.
+        norm: Normalization strategy (currently ``layernorm`` or ``none``).
+
+    Shapes:
+        x: ``(batch, 1)`` single-feature column.
+        returns: ``(batch, 1)`` contribution for that feature.
+    """
 
     def __init__(self,
                  hidden_units: Tuple[int, ...],
@@ -66,7 +77,12 @@ class FeatureMLP(nn.Module):
 
 
 class ParallelFeatureMLP(nn.Module):
-    """Vectorized per-feature MLP implemented with einsum for scalability."""
+    """Vectorized per-feature MLP implemented with einsum for scalability.
+
+    Shapes:
+        x: ``(batch, n_features)`` dense feature matrix.
+        returns: ``(batch, n_features)`` stacked per-feature outputs.
+    """
 
     def __init__(
         self,
@@ -118,7 +134,14 @@ class ParallelFeatureMLP(nn.Module):
 
 
 class BaseGAM(nn.Module):
-    """Additive GAM trunk with a global bias term."""
+    """Additive GAM trunk with a global bias term.
+
+    Shapes:
+        x: ``(batch, n_features)`` scaled input.
+        returns: ``(base_per_feature, base_sum)`` where
+            - ``base_per_feature`` is ``(batch, n_features)``
+            - ``base_sum`` is ``(batch, 1)`` summed with bias.
+    """
 
     def __init__(
         self,
@@ -157,7 +180,18 @@ class BaseGAM(nn.Module):
 
 
 class GroupResidualHead(nn.Module):
-    """Group-specific residual correction via FiLM/LoRA-style adapters."""
+    """Group-specific residual correction via FiLM/LoRA-style adapters.
+
+    Shapes:
+        x: ``(batch, input_dim)`` scaled features.
+        group_idx: ``(batch,)`` integer group ids (currently one group column for all features).
+        returns: ``(batch, n_features)`` residual deltas added to the base.
+
+    Note:
+        Per-feature group columns can be supported in the future by expanding ``group_idx``
+        to ``(batch, n_features)`` and broadcasting gamma/beta accordingly; current implementation
+        assumes a single group id per sample for all features.
+    """
 
     def __init__(
         self,
@@ -221,7 +255,20 @@ class GroupResidualHead(nn.Module):
 
 
 class GroupAffineHead(nn.Module):
-    """Group-wise affine calibration head following hierarchical regression."""
+    """Group-wise affine calibration head following hierarchical regression.
+
+    Shapes:
+        base_contribs: ``(batch, n_features)`` base contributions.
+        group_idx: ``(batch,)`` integer group ids (currently one group column for all features).
+        returns: tuple of
+            - adjusted: ``(batch, n_features)`` after affine warp
+            - total: ``(batch,)`` summed contribution
+            - delta_sum: ``(batch,)`` sum of adjustments vs. base
+
+    Note:
+        Extension to per-feature group columns would accept ``group_idx`` as ``(batch, n_features)``
+        and gather scale/shift per feature; this implementation assumes a single group id per sample.
+    """
 
     def __init__(
         self,

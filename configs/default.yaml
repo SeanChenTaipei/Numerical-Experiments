@@ -1,28 +1,96 @@
-experiment_name: baseline_logreg
-dataset:
-  name: iris
-  test_size: 0.2
-  random_state: 42
-preprocessing:
-  impute_strategy: mean
-  scale: true
-model:
-  type: logistic_regression
-  params:
-    penalty: l2
-    C: 1.0
-    solver: lbfgs
-    max_iter: 200
-training:
-  use_class_weight: false
-  scoring: accuracy
-  cross_validation:
-    enabled: true
-    folds: 5
-evaluation:
-  metrics:
-    - accuracy
-    - f1_macro
-outputs:
-  model_dir: artifacts/models
-  reports_dir: artifacts/reports
+experiment:
+  name: temporal_regression_lab
+  override_path: configs/experiment.yaml
+  seed: 42
+  description: Unified temporal-group regression workflow
+  cache_tag: default
+
+streams:
+  tabs:
+    - Data Explorer
+    - Time Split & Prep
+    - Drift Lab
+    - Modeling
+    - ICC Studio
+    - Tree Score
+    - Investigation
+    - Reports & Artifacts
+
+data:
+  defaults:
+    timestamp: timestamp
+    group: machine_id
+    target: target_main
+    factor_table_col: FactorName
+  synthetic:
+    rows: 5000
+    groups: 12
+  explorer:
+    max_rows: 5000
+  split:
+    mode: by_ratio
+    ratios:
+      train: 0.6
+      val: 0.2
+      test: 0.2
+    dates:
+      val_start: 2023-01-01
+      test_start: 2023-06-01
+  ingest:
+    allowed_formats: [csv, feather]
+
+preprocess:
+  missing_ratio_threshold: 0.4
+  vif_threshold: 12.0
+  encoding_folds: 5
+  timestamp_col: timestamp
+  encoding_strategy: target
+  scaler: robust
+
+modeling:
+  cv:
+    n_folds: 4
+    stability_top_k: 10
+  models:
+    lightgbm:
+      learning_rate: 0.05
+      num_leaves: 31
+      n_estimators: 400
+    catboost:
+      depth: 6
+      learning_rate: 0.05
+      iterations: 800
+    ebm:
+      max_leaves: 5
+      learning_rate: 0.05
+
+metrics:
+  regression: [rmse, mae, r2, medae]
+
+risk:
+  default_threshold: 0.2
+
+drift:
+  thresholds:
+    psi: 0.2
+    ks: 0.2
+    cvm: 0.05
+    js: 0.15
+    tv: 0.35
+    wasserstein: 0.75
+
+icc:
+  default_metric: ICC2
+  use_residuals: false
+
+tree_score:
+  max_depth: 3
+  min_samples_leaf: 40
+
+probes:
+  bins: 7D
+  top_groups: 10
+
+reports:
+  artifacts_dir: artifacts
+  plots_dir: artifacts/plots

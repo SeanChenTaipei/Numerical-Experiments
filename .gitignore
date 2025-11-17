@@ -13,7 +13,9 @@ notebooks/.ipynb_checkpoints/
 .ipynb_checkpoints
 
 # Training artifacts
-artifacts/
+artifacts/*
+!artifacts/plots/
+!artifacts/plots/**
 checkpoints/
 notebooks/checkpoints/
 notebooks/lightning_logs/

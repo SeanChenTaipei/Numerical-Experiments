@@ -53,6 +53,8 @@ from .helpers import (
 
 ArrayLike = Union[pd.DataFrame, np.ndarray]
 MetricFn = Callable[[np.ndarray, np.ndarray], float]
+GroupMapper = Callable[[pd.DataFrame, Optional[Any]], Sequence[Any]]
+FeatureGroupMap = Dict[str, str]
 
 
 def _ensure_tuple(units: Optional[Sequence[int]],
@@ -170,7 +172,7 @@ class GroupCrossEncoder:
         return str(value)
 
 
-class MixedGAMRegressor:
+class ConditionalSNNRegressor:
     """Hierarchical additive regressor with Lightning training and plotting utilities."""
 
     def __init__(
@@ -228,6 +230,8 @@ class MixedGAMRegressor:
         self._feature_reference: Optional[np.ndarray] = None
         self._feature_ranges: Optional[np.ndarray] = None
         self._feature_name_to_idx: Dict[str, int] = {}
+        self.feature_names_in_: Optional[np.ndarray] = None
+        self.n_features_in_: Optional[int] = None
         self._n_features: Optional[int] = None
         self._n_groups: Optional[int] = None
         self._group_counts: Dict[str, int] = {}
@@ -235,6 +239,10 @@ class MixedGAMRegressor:
         self._is_fitted = False
         self.training_history: List[float] = []
         self.cached_contribs_: Optional[Dict[str, np.ndarray]] = None
+        self.feature_importance_: Optional[Dict[str, float]] = None
+        self.use_grouping = True
+        self.group_mapper: Optional[GroupMapper] = None
+        self.feature_group_map: Optional[FeatureGroupMap] = None
 
     def fit(
         self,
@@ -248,9 +256,12 @@ class MixedGAMRegressor:
         val_ratio: Optional[float] = 0.2,
         callbacks: Optional[Sequence[Callback]] = None,
         progress_refresh_rate: int = 10,
-    ) -> "MixedGAMRegressor":
+        use_grouping: bool = True,
+        group_mapper: Optional[GroupMapper] = None,
+        feature_group_map: Optional[FeatureGroupMap] = None,
+    ) -> "ConditionalSNNRegressor":
         """
-        分步訓練 MixedGAMRegressor。
+        分步訓練 ConditionalSNNRegressor。
 
         步驟：
             1. 轉成 numpy 陣列並檢查 X/y/groups 尺寸，必要時切分驗證集。
@@ -262,22 +273,27 @@ class MixedGAMRegressor:
         參數：
             X: 特徵矩陣 (DataFrame 或 ndarray)。
             y: 目標值向量。
-            groups: 每筆資料的群組標籤，若未提供則以 `__global__` 視為單一群組。
+            groups: 每筆資料的群組標籤，若未提供則以 `__global__` 視為單一群組。可以是一維序列，或是包含群組欄位的 DataFrame。
             X_val / y_val / groups_val: 額外驗證集；缺省時依 `val_ratio` 切分。
             val_ratio: 驗證集比例。
             callbacks: 自訂 Lightning callback。
             progress_refresh_rate: tqdm 進度條更新頻率。
+            use_grouping: False 時忽略群組，全部視為 `__global__`。
+            group_mapper: 函式簽名 (df, raw_groups) -> labels，用來自訂群組邏輯。
+            feature_group_map: Dict[feature_name, group_column]，宣告每個特徵對應的群組欄位。
+                目前實作僅接受「所有特徵對應同一個群組欄位」的情境；不同欄位會 raise NotImplementedError。
 
         返回：
-            已訓練完成的 `MixedGAMRegressor`。
+            已訓練完成的 `ConditionalSNNRegressor`。
         """
         verbose_flag = self.config.verbose
         logger_flag = bool(verbose_flag)
         if verbose_flag:
             print(
-                f"[MixedGAM] Training mode={self.mode} via PyTorch Lightning..."
+                f"[ConditionalSNN] Training mode={self.mode} via PyTorch Lightning..."
             )
         self.cached_contribs_ = None
+        self.feature_importance_ = None
 
         # 步驟 1：將輸入轉為 numpy 陣列並確認維度
         X_array, feature_names = self._prepare_features(X)
@@ -285,12 +301,17 @@ class MixedGAMRegressor:
         if X_array.shape[0] != y_array.shape[0]:
             raise ValueError("X and y must contain the same number of rows.")
 
-        if groups is None:
-            group_labels = np.array(["__global__"] * len(y_array))
-        else:
-            group_labels = np.asarray(groups).astype(str)
-            if group_labels.shape[0] != len(y_array):
-                raise ValueError("groups must match the number of rows in X.")
+        self.use_grouping = bool(use_grouping)
+        self.group_mapper = group_mapper
+        self.feature_group_map = feature_group_map
+        group_labels = self._prepare_group_labels(
+            X_array,
+            groups,
+            feature_names,
+            mapper=group_mapper,
+            use_grouping=use_grouping,
+            feature_group_map=feature_group_map,
+        )
 
         # 步驟 2：若啟用 Ray Tune，自動搜尋超參數
         self._maybe_run_auto_search(X, y, group_labels)
@@ -316,13 +337,14 @@ class MixedGAMRegressor:
             if X_val_array.shape[0] != y_val_array.shape[0]:
                 raise ValueError(
                     "X_val and y_val must contain the same number of rows.")
-            if groups_val is None:
-                groups_val_array = np.array(["__global__"] * len(y_val_array))
-            else:
-                groups_val_array = np.asarray(groups_val).astype(str)
-                if groups_val_array.shape[0] != len(y_val_array):
-                    raise ValueError(
-                        "groups_val must match the number of rows in X_val.")
+            groups_val_array = self._prepare_group_labels(
+                X_val_array,
+                groups_val,
+                feature_names,
+                mapper=group_mapper,
+                use_grouping=use_grouping,
+                feature_group_map=feature_group_map,
+            )
         elif val_ratio is not None and val_ratio > 0:
             if not 0 < val_ratio < 1:
                 raise ValueError("val_ratio must be between 0 and 1.")
@@ -355,6 +377,8 @@ class MixedGAMRegressor:
             groups_val_array = np.asarray(groups_val_array).astype(str)
 
         self.feature_names = feature_names
+        self.feature_names_in_ = np.asarray(feature_names)
+        self.n_features_in_ = len(feature_names)
         self._feature_name_to_idx = {
             name: idx
             for idx, name in enumerate(feature_names)
@@ -487,7 +511,7 @@ class MixedGAMRegressor:
 
         if verbose_flag:
             print(
-                f"[MixedGAM] Finished training. Last loss={self.training_history[-1]:.5f}"
+                f"[ConditionalSNN] Finished training. Last loss={self.training_history[-1]:.5f}"
             )
 
         return self
@@ -602,6 +626,16 @@ class MixedGAMRegressor:
                 adjusted[key] = arr * scale
         return adjusted
 
+    def _compute_feature_importance(
+            self, contribs: Dict[str, np.ndarray]) -> Dict[str, float]:
+        per_feature = contribs["per_feature"]
+        importance = np.abs(per_feature).mean(axis=0)
+        assert self.feature_names is not None
+        return {
+            name: float(importance[idx])
+            for idx, name in enumerate(self.feature_names)
+        }
+
     def feature_importance(
         self,
         X: Optional[ArrayLike] = None,
@@ -616,13 +650,9 @@ class MixedGAMRegressor:
             contribs = self.cached_contribs_
         else:
             _, contribs = self.predict_and_contrib(X, groups=groups)
-        per_feature = contribs["per_feature"]
-        importance = np.abs(per_feature).mean(axis=0)
-        assert self.feature_names is not None
-        return {
-            name: float(importance[idx])
-            for idx, name in enumerate(self.feature_names)
-        }
+        result = self._compute_feature_importance(contribs)
+        self.feature_importance_ = result
+        return result
 
     def _cache_training_contribs(self, X_full: np.ndarray,
                                  group_labels: Sequence[str]) -> None:
@@ -634,11 +664,13 @@ class MixedGAMRegressor:
         except Exception as exc:  # pragma: no cover - best effort
             if self.config.verbose:
                 print(
-                    f"[MixedGAM] Failed to cache training contributions: {exc}"
+                    f"[ConditionalSNN] Failed to cache training contributions: {exc}"
                 )
             self.cached_contribs_ = None
         else:
             self.cached_contribs_ = contribs
+            self.feature_importance_ = self._compute_feature_importance(
+                contribs)
 
     def get_feature_shape(
         self,
@@ -783,6 +815,8 @@ class MixedGAMRegressor:
                 self._init_kwargs,
                 "feature_names":
                 self.feature_names,
+                "feature_names_in":
+                self.feature_names_in_,
                 "scaler":
                 self.scaler,
                 "target_scaler":
@@ -794,6 +828,8 @@ class MixedGAMRegressor:
                 self._n_features,
                 "n_groups":
                 self._n_groups,
+                "n_features_in":
+                self.n_features_in_,
                 "mode":
                 self.mode,
                 "feature_reference":
@@ -806,17 +842,24 @@ class MixedGAMRegressor:
                 self.default_groups_,
                 "cached_contribs":
                 self.cached_contribs_,
+                "feature_importance":
+                self.feature_importance_,
+                "use_grouping":
+                self.use_grouping,
+                "feature_group_map":
+                self.feature_group_map,
             },
             str(extras_path),
         )
 
     @classmethod
     def load(cls, model_path: str | Path,
-             extras_path: str | Path) -> "MixedGAMRegressor":
+             extras_path: str | Path) -> "ConditionalSNNRegressor":
         extras = joblib.load(str(extras_path))
         model = cls(**extras.get("config", {}))
         model.mode = extras.get("mode", model.mode)
         model.feature_names = extras.get("feature_names")
+        model.feature_names_in_ = extras.get("feature_names_in")
         model.scaler = extras.get("scaler")
         model.target_scaler = extras.get("target_scaler")
         encoder_state = extras.get("encoder_state")
@@ -826,11 +869,15 @@ class MixedGAMRegressor:
             model.group_encoder = encoder
         model._n_features = extras.get("n_features")
         model._n_groups = extras.get("n_groups")
+        model.n_features_in_ = extras.get("n_features_in")
         model._feature_reference = extras.get("feature_reference")
         model._feature_ranges = extras.get("feature_ranges")
         model._feature_name_to_idx = extras.get("feature_name_to_idx", {})
         model.default_groups_ = extras.get("default_groups", [])
         model.cached_contribs_ = extras.get("cached_contribs")
+        model.feature_importance_ = extras.get("feature_importance")
+        model.use_grouping = extras.get("use_grouping", True)
+        model.feature_group_map = extras.get("feature_group_map")
         model._build_networks()
 
         checkpoint = torch.load(str(model_path), map_location=model.device)
@@ -841,13 +888,6 @@ class MixedGAMRegressor:
         model.head.eval()
         model._is_fitted = True
         return model
-
-
-class ConditionalSNNRegressor(MixedGAMRegressor):
-    """Alias for ``MixedGAMRegressor`` with branding aligned to ConditionalSNN."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
 
     @classmethod
     def ray_tune_search(
@@ -869,9 +909,9 @@ class ConditionalSNNRegressor(MixedGAMRegressor):
         """Hyper-parameter search with Ray Tune + ASHAScheduler.
 
         Example:
-            >>> search = MixedGAMRegressor.ray_tune_search(X, y, groups=g)
+            >>> search = ConditionalSNNRegressor.ray_tune_search(X, y, groups=g)
             >>> best_cfg = search["best_config"]
-            >>> model = MixedGAMRegressor(**best_cfg)
+            >>> model = ConditionalSNNRegressor(**best_cfg)
             >>> model.fit(X, y, groups=g)
         """
         try:
@@ -1100,7 +1140,7 @@ class ConditionalSNNRegressor(MixedGAMRegressor):
         if not self.auto_search or self._search_performed:
             return
         if self.config.verbose:
-            print("[MixedGAM] Running Ray Tune auto-search...")
+            print("[ConditionalSNN] Running Ray Tune auto-search...")
 
         try:
             search_result = self.ray_tune_search(
@@ -1117,7 +1157,7 @@ class ConditionalSNNRegressor(MixedGAMRegressor):
         except ImportError:
             if self.config.verbose:
                 print(
-                    "[MixedGAM] Skipping auto-search because Ray Tune is not installed."
+                    "[ConditionalSNN] Skipping auto-search because Ray Tune is not installed."
                 )
             return
         best_params = search_result.get("best_config") or {}
@@ -1133,7 +1173,7 @@ class ConditionalSNNRegressor(MixedGAMRegressor):
         }
         self._search_performed = True
         if self.config.verbose and best_params:
-            print(f"[MixedGAM] Auto-search best params: {best_params}")
+            print(f"[ConditionalSNN] Auto-search best params: {best_params}")
 
     def _prepare_features(
         self,
@@ -1153,6 +1193,70 @@ class ConditionalSNNRegressor(MixedGAMRegressor):
             else:
                 names = expect_feature_names or self.feature_names  # type: ignore[arg-type]
         return values, names
+
+    def _prepare_group_labels(
+        self,
+        X_array: np.ndarray,
+        groups: Optional[Sequence[Any]],
+        feature_names: List[str],
+        *,
+        mapper: Optional[GroupMapper],
+        use_grouping: bool,
+        feature_group_map: Optional[FeatureGroupMap],
+    ) -> np.ndarray:
+        """Resolve group labels for each sample.
+
+        Args:
+            X_array: (n_samples, n_features) array.
+            groups: User-provided grouping, either 1D array-like or DataFrame containing group columns.
+            feature_names: Names of features (aligned with X_array).
+            mapper: Optional callable df, raw_groups -> labels; used if provided.
+            use_grouping: When False, returns all `__global__`.
+            feature_group_map: Mapping feature_name -> group column name. Currently all features must map to the same column.
+
+        Returns:
+            ndarray of shape (n_samples,) containing group labels.
+        """
+        n_samples = X_array.shape[0]
+        if not use_grouping:
+            return np.array(["__global__"] * n_samples)
+
+        if mapper is not None:
+            df = pd.DataFrame(X_array, columns=feature_names)
+            resolved = np.asarray(mapper(df, groups)).astype(str)
+            if resolved.shape[0] != n_samples:
+                raise ValueError(
+                    "group_mapper must return one group label per sample.")
+            return resolved
+
+        if feature_group_map:
+            unique_cols = set(feature_group_map.values())
+            if len(unique_cols) != 1:
+                raise NotImplementedError(
+                    "Per-feature group columns are not yet supported; provide a single column for now."
+                )
+            column = next(iter(unique_cols))
+            if isinstance(groups, pd.DataFrame):
+                if column not in groups.columns:
+                    raise KeyError(
+                        f"Column '{column}' not found in provided groups DataFrame."
+                    )
+                labels = groups[column].astype(str).values
+            else:
+                raise ValueError(
+                    "feature_group_map provided, but `groups` is not a DataFrame containing that column."
+                )
+            if labels.shape[0] != n_samples:
+                raise ValueError("groups must match the number of rows in X.")
+            return labels
+
+        if groups is None:
+            return np.array(["__global__"] * n_samples)
+
+        labels = np.asarray(groups).astype(str)
+        if labels.shape[0] != n_samples:
+            raise ValueError("groups must match the number of rows in X.")
+        return labels
 
     @staticmethod
     def _make_scaler(scaler_type: Optional[str]) -> Any:
@@ -1292,7 +1396,8 @@ class ConditionalSNNRegressor(MixedGAMRegressor):
 
     def _check_fitted(self) -> None:
         if not self._is_fitted or self.base_gam is None or self.head is None:
-            raise RuntimeError("Call `fit` before using MixedGAMRegressor.")
+            raise RuntimeError(
+                "Call `fit` before using ConditionalSNNRegressor.")
 
     @staticmethod
     def _ensure_array_inputs(
@@ -1313,3 +1418,7 @@ def default_metric(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def dataclass_fields(cls: Any) -> List[Any]:
     return list(getattr(cls, "__dataclass_fields__", {}).values())
+
+
+# Backward compatibility for legacy imports
+MixedGAMRegressor = ConditionalSNNRegressor
