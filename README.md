@@ -1,108 +1,163 @@
-# Temporal Group Regression Lab
+# SmartCategoricalEncoder Manual
 
-A fully-operational Python + Streamlit toolkit for tabular regression problems that simultaneously exhibit **temporal structure** (timestamps) and **group structure** (machines, batches, SKUs). The app loads CSV/Feather files (or auto-generates realistic synthetic data), performs time-aware preprocessing, builds LightGBM/CatBoost/EBM models, evaluates drift & ICC stability, scores single features with shallow decision trees, and exposes an extensible probe-based EDA playbook.
+A lightweight yet extensible categorical feature encoder that surveys every column, picks a strategy that matches its statistics, and exposes a registry for plugging in custom encoders. This document explains what is bundled, how the auto-strategy rules work, and how to integrate the encoder inside scikit-learn pipelines.
 
-## Key Capabilities
+## Highlights
+- **One class, many encoders** - Target/CatBoost/James-Stein/WoE/LOO/Hashing/Embedding/Helmert/Rare grouping/etc. are all unified under `SmartCategoricalEncoder`.
+- **Auto strategy** - cardinality, unique ratio, rare share, and missing rate drive the recommendation when `strategy="auto"`.
+- **Manual overrides** - pass `strategy={"col_name": "hashing"}` or a single strategy string to force behaviour.
+- **Plug-in ready** - custom column encoders can be registered via `SmartCategoricalEncoder.register_encoder("name", cls)`.
+- **Sklearn compatible** - implements `fit`, `transform`, `fit_transform`, and works inside `Pipeline`/`ColumnTransformer`.
+- **Persistence** - save/load through `joblib` for reproducible deployments.
 
-- **Unified configuration** via configs/default.yaml + optional overrides. Centralizes timestamp/group/factor columns, preprocessing strategy, drift & ICC settings, and Streamlit defaults.
-- **Factory-driven architecture** (DataLoaderFactory, ModelTrainerFactory, ProbeRegistry) wrapped under src/timeseries_lab/ modules (data_io, split, preprocess, drift, icc, 	ree_score, probe, iz, utils).
-- **Caching everywhere it matters**: Streamlit @st.cache_data/@st.cache_resource guard dataset loading, splits, preprocessing, drift tables, ICC summaries, tree scores, and probe payloads (cache keys include hashes of config + data).
-- **Temporal splits & coverage reports** supporting ratio/date modes plus group coverage sanity checks.
-- **Modeling suite** with expanding-window CV, RMSE/MAE/R2/MedAE metrics, permutation importances, and Top-K Jaccard stability tracking.
-- **Comprehensive monitoring**: PSI/KS/CVM/JS/TV/Wasserstein drift metrics, ICC(1/2/3) stability, residual heatmaps, and Tree Score radar/bars. High-drift/high-impact features are auto-flagged.
-- **Probe-based EDA Playbook** (6 pre-built probes) returning titles, markdown summaries, tables, Plotly figs, and tags that can be exported to Markdown/HTML reports.
-- **Artifacts**: 10+ Plotly visualizations auto-saved under rtifacts/plots/ on import, plus report downloads (JSON + Markdown) from the Streamlit UI.
+## Installation
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
 
-## Project Layout
+## Quick Start
+```python
+import pandas as pd
+from src.pipeline.smart_categorical_encoder import SmartCategoricalEncoder
 
-`
-app.py                              # Streamlit entrypoint with 8 tabs + sidebar controls
-configs/default.yaml                # Central configuration (overridable via configs/experiment.yaml)
-src/timeseries_lab/
-  ¢u¢w¢w data_io.py                    # File loaders + synthetic generator
-  ¢u¢w¢w split.py                      # TimeSplitService + SplitResult dataclass
-  ¢u¢w¢w preprocess.py                 # Target encoding, VIF filtering, RobustScaler pipeline
-  ¢u¢w¢w modeling.py                   # ModelTrainerFactory + expanding-window CV orchestration
-  ¢u¢w¢w drift.py                      # DriftAnalyzer for PSI/KS/CVM/Wasserstein/JS/TV
-  ¢u¢w¢w icc.py                        # ICCAnalyzer with pingouin fallback + summaries
-  ¢u¢w¢w tree_score.py                 # Shallow decision-tree feature scoring
-  ¢u¢w¢w probe.py                      # Probe registry/decorator + 6 built-in probes
-  ¢u¢w¢w viz.py                        # Plotly helpers + artifact bootstrapper (10+ plots saved)
-  ¢u¢w¢w utils.py                      # Hashing, sampling, coverage helpers
-  ¢|¢w¢w settings.py                   # Config loading facade + artifact path helpers
-artifacts/plots/                    # Auto-generated Plotly HTML figures
-requirements.txt                    # Version-bounded dependencies (Streamlit, Plotly, LGBM, CatBoost, EBM, etc.)
-tests/                              # Split/Drift/ICC/Tree Score unit tests
-`
+X = pd.DataFrame(
+    {
+        "city": ["NY", "NY", "SF", "LA", None],
+        "device": ["ios", "android", "web", "ios", "web"],
+        "gender": ["F", "M", "F", "F", "M"],
+    }
+)
+y = pd.Series([1, 0, 1, 0, 1], name="label")
 
-## Getting Started
+encoder = SmartCategoricalEncoder(
+    strategy="auto",
+    params={
+        "general": {
+            "rare_threshold": 0.05,
+            "max_onehot_cardinality": 12,
+            "max_target_cardinality": 60,
+            "max_hash_cardinality": 200,
+        },
+        "target": {"smoothing": 15.0},
+        "hashing": {"n_features": 32},
+    },
+    random_state=42,
+)
 
-1. **Environment**
+X_enc = encoder.fit_transform(X, y)
+print(X_enc.head())
+print(encoder.get_feature_names())
+encoder.save("artifacts/smart_encoder.joblib")
+```
 
-   `ash
-   python -m venv .venv
-   .venv\Scripts\activate   # Windows
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   `
+## Auto Strategy Cheat Sheet
+| Condition | Suggested Strategy |
+| --- | --- |
+| Cardinality <= 12 | One-Hot |
+| 12 < card <= 60 & label available | CatBoost / Target |
+| 12 < card <= 60 & no label | Ordinal |
+| 60 < card <= 200 & label | Target (smoothing) |
+| 60 < card <= 200 & no label | Hashing |
+| Cardinality > 200 & label | Multi-Hash Embedding |
+| Cardinality > 200 & no label | Entity Embedding |
+| Missing rate > 20% & label | CatBoost |
+| Unique ratio > 0.9 & label | Multi-Hash |
+| Rare share over threshold | Rare Category Grouping (then One-Hot/Target) |
+| Leakage risk / CV pipelines | Leave-One-Out with proper folds |
 
-2. **Run the Streamlit Lab**
+All thresholds are configurable under `params["general"]`.
 
-   `ash
-   streamlit run app.py
-   `
+## Built-in Encoders
+| Strategy | Works Best For | Notes |
+| --- | --- | --- |
+| `onehot` | Low-cardinality nominal features | Produces dense matrix (no sparse output). |
+| `ordinal` | Medium cardinality without a target | Encodes categories as integers with -1 for unseen. |
+| `target` | Supervised tasks with enough samples | Mean target with smoothing + optional noise. |
+| `catboost` | High-cardinality supervised data | Online-style mean encoding to reduce leakage. |
+| `james_stein` | Regression tasks needing shrinkage | Weighted mix of group mean and global mean. |
+| `woe` | Binary classification / risk models | Requires binary target, outputs log odds. |
+| `leave_one_out` | Leakage-sensitive setups | Per-row target mean excluding the row itself. |
+| `count`/`frequency` | Unsupervised feature weighting | Maps categories to counts or normalized counts. |
+| `hashing` | Huge vocabularies without y | Feature hashing with configurable dimension. |
+| `binary` | Mid-cardinality without target | Converts category index to binary digits. |
+| `helmert` | ANOVA / contrast coding | Produces (k-1) orthogonal contrasts. |
+| `rare_grouping` | Columns with long tails | Buckets infrequent values into a shared "rare" column. |
+| `embedding` | Dense representation for high card | One-Hot + TruncatedSVD approximation. |
+| `multi_hash` | Recommender-style IDs | Multiple hashes with learned embeddings per bucket. |
 
-   - Use the sidebar to upload df_data / df_factors or rely on the built-in synthetic generator.
-   - Select target/group/timestamp columns, tweak split mode (ratio/date), drift thresholds, model choice, ICC/drift settings, and probe parameters.
-   - Every heavy computation is cached; use the ¡§Clear cache¡¨ button if you change upstream files/configs.
+Each encoder accepts parameters via the `params` dictionary (`{"hashing": {"n_features": 128}}`, etc.).
 
-3. **Artifacts & Reports**
+## Column Survey Metrics
+`fit` computes per-column stats stored under `column_stats_`:
+- `cardinality`: distinct non-null categories
+- `unique_ratio`: `cardinality / non_null_rows`
+- `rare_share`: portion of rows occupied by rare categories
+- `missing_rate`: NaN share
+- `most_common_freq`: dominant category frequency
 
-   - All charts have associated download buttons; HTML copies also live under rtifacts/plots/.
-   - The ¡§Reports & Artifacts¡¨ tab exports a consolidated JSON + Markdown summary (metrics, drift alerts, ICC status, probe highlights).
+Use these values (and `decision_log_`) to inspect what the auto-strategy picked.
 
-4. **Unit Tests**
+## Extending With Custom Encoders
+```python
+from src.pipeline.smart_categorical_encoder import SmartCategoricalEncoder, _BaseColumnEncoder
 
-   `ash
-   pytest
-   `
+class ConstantEncoder(_BaseColumnEncoder):
+    """Maps every category to the same scalar value (demo)."""
 
-## Configuration Notes
+    def __init__(self, column: str, value: float = 0.0) -> None:
+        super().__init__(column)
+        self.value = value
+        self.feature_names_ = [f"{column}__constant"]
 
-- Override defaults by editing configs/experiment.yaml or pointing EXPERIMENT_CONFIG to another YAML.
-- Key sections:
-  - data.defaults: timestamp/group/target/factor column names.
-  - preprocess: target encoding folds, VIF threshold, missingness cap.
-  - modeling: per-model hyperparameters + CV settings.
-  - drift / icc / 	ree_score: risk thresholds and scoring knobs.
-  - probes: binning cadence + Top-N controls for the EDA playbook.
+    def fit(self, series, y=None):
+        return self
 
-## Generating Synthetic Data on Disk
+    def transform(self, series):
+        return pd.DataFrame(self.value, index=series.index, columns=self.feature_names_)
 
-Run the helper below to persist the default synthetic dataset (optional):
+SmartCategoricalEncoder.register_encoder("constant", ConstantEncoder)
+enc = SmartCategoricalEncoder(strategy={"city": "constant"}, params={"constant": {"value": 0.7}})
+```
 
-`ash
-python - <<"PY"
-from pathlib import Path
-from timeseries_lab.data_io import DataLoaderFactory
-bundle = DataLoaderFactory.fallback_synthetic(rows=5000, groups=12)
-bundle.df_data.to_csv("data/synthetic_data.csv", index=False)
-bundle.df_factors.to_csv("data/synthetic_factors.csv", index=False)
-PY
-`
+## Pipeline / ColumnTransformer Integration
+```python
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier
 
-## Testing & Quality
+cat_cols = ["city", "device", "gender"]
+num_cols = ["age", "income"]
 
-- 	ests/test_split.py: verifies chronological ratio splitting & coverage integrity.
-- 	ests/test_drift.py: ensures drift metrics & risk annotations are present.
-- 	ests/test_icc.py: validates ICC table construction.
-- 	ests/test_tree_score.py: checks shallow-tree scoring outputs.
+preprocess = ColumnTransformer(
+    transformers=[
+        ("categorical", SmartCategoricalEncoder(strategy="auto", random_state=21), cat_cols),
+        ("numeric", "passthrough", num_cols),
+    ]
+)
 
-## Design Patterns & Extensibility
+pipeline = Pipeline([
+    ("preprocess", preprocess),
+    ("model", RandomForestClassifier()),
+])
 
-- **Factory Pattern**: DataLoaderFactory picks CSV/Feather/Synthetic loaders; ModelTrainerFactory instantiates LightGBM/CatBoost/EBM trainers.
-- **Registry Pattern**: ProbeRegistry uses decorators to register probes, making it trivial to add new investigative recipes.
-- **Dependency Injection**: Config dictionaries flow through each service (split, preprocessing, drift, ICC, tree score) enabling reproducible overrides and straightforward unit tests.
-- **Caching Strategy**: hash_pandas_frame + config hashes guarantee cache keys reflect both data and settings; clearing caches is a single click from the UI.
+pipeline.fit(train_X, train_y)
+y_pred = pipeline.predict(test_X)
+```
 
-Happy analyzing! ??
+## Persistence & Reuse
+```python
+encoder.save("artifacts/encoder.joblib")
+loaded = SmartCategoricalEncoder.load("artifacts/encoder.joblib")
+assert loaded.get_feature_names() == encoder.get_feature_names()
+```
+
+## Troubleshooting
+- **Missing columns at transform** - the transformer expects the same categorical columns observed during `fit`.
+- **Binary-only strategies (WoE)** - ensure `y` has exactly two unique values.
+- **High variance in target encoders** - increase smoothing or add Gaussian noise via params.
+- **Rare categories not grouped** - raise `params["general"]["rare_threshold"]` or pre-group with domain rules.
+
+Happy encoding!
