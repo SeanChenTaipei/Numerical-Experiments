@@ -1,494 +1,824 @@
-from __future__ import annotations
+import os
+from typing import Dict, List, Optional, Tuple
 
-import json
-import copy
-from typing import Dict, List, Tuple
-
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import seaborn as sns
 import streamlit as st
-from omegaconf import OmegaConf
 import plotly.express as px
-
-from timeseries_lab import (
-    DataLoaderFactory,
-    DriftAnalyzer,
-    ICCAnalyzer,
-    TreeScoreAnalyzer,
-    TimeSplitService,
-    load_config,
-    viz,
+from plotly import graph_objects as go
+from catboost import CatBoostClassifier
+from interpret.glassbox import ExplainableBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    precision_recall_fscore_support,
+    roc_auc_score,
+    roc_curve,
 )
-from timeseries_lab.modeling import ModelTrainerFactory, run_time_series_cv, METRIC_FNS
-from timeseries_lab.preprocess import Preprocessor
-from timeseries_lab.probe import ProbeRegistry
-from timeseries_lab.utils import hash_pandas_frame, stable_hash, maybe_sample_df
+from sklearn.model_selection import StratifiedKFold
+from sklearn import compose
+
+# Optional dependencies
+try:
+    import shap
+
+    HAS_SHAP = True
+except ImportError:  # pragma: no cover - optional dependency
+    HAS_SHAP = False
+
+try:
+    from rulefit import RuleFit
+
+    HAS_RULEFIT = True
+except ImportError:  # pragma: no cover - optional dependency
+    HAS_RULEFIT = False
+
+try:
+    from evidently import ColumnMapping
+    from evidently.metrics import DataDriftPreset, DataQualityPreset, TargetDriftPreset
+    from evidently.report import Report
+
+    HAS_EVIDENTLY = True
+except ImportError:  # pragma: no cover - optional dependency
+    HAS_EVIDENTLY = False
+
+st.set_page_config(page_title="Binary Anomaly Analysis", layout="wide")
 
 
-st.set_page_config(page_title="Temporal Regression Lab", layout="wide")
+# ------------------------------------------------------------
+# Data loading helpers (csv / feather / pickle)
+# ------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def load_any_from_path(path: str) -> pd.DataFrame:
+    """Load a DataFrame from disk based on extension (csv / feather / pickle)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        return pd.read_csv(path)
+    if ext == ".feather":
+        return pd.read_feather(path)
+    if ext in (".pkl", ".pickle"):
+        return pd.read_pickle(path)
+    raise ValueError(f"Unsupported file extension: {ext}")
 
 
-def _default_index(options: List[str], target: str) -> int:
-    try:
-        return options.index(target)
-    except (ValueError, AttributeError):
-        return 0
+@st.cache_data(show_spinner=False)
+def load_any_from_upload(uploaded_file) -> pd.DataFrame:
+    """Load a DataFrame from an uploaded Streamlit file object."""
+    name = uploaded_file.name
+    ext = os.path.splitext(name)[1].lower()
+    if ext == ".csv":
+        return pd.read_csv(uploaded_file)
+    if ext == ".feather":
+        return pd.read_feather(uploaded_file)
+    if ext in (".pkl", ".pickle"):
+        return pd.read_pickle(uploaded_file)
+    # Fallback: try CSV if extension is unexpected
+    return pd.read_csv(uploaded_file)
 
 
-def figure_block(fig, name: str) -> None:
+@st.cache_data(show_spinner=False)
+def detect_feature_columns(
+    df: pd.DataFrame, target_col: str, extra_exclude: Optional[List[str]] = None
+) -> List[str]:
+    """Infer training feature columns: prefer ALL_CAPS_WITH_UNDERSCORE, exclude target."""
+    exclude = {target_col}
+    if extra_exclude:
+        exclude.update(extra_exclude)
+    feature_cols = [
+        c
+        for c in df.columns
+        if c not in exclude and c.isupper() and all(ch.isalnum() or ch == "_" for ch in c)
+    ]
+    if not feature_cols:
+        feature_cols = [c for c in df.columns if c not in exclude]
+    return feature_cols
+
+
+@st.cache_data(show_spinner=False)
+def compute_class_weights(y: np.ndarray, w0: float, w1: float) -> np.ndarray:
+    """Return per-sample weights given class-specific weights."""
+    return np.where(y == 1, w1, w0)
+
+
+# ------------------------------------------------------------
+# Model building / CV
+# ------------------------------------------------------------
+
+def build_model(model_name: str, params: Dict) -> object:
+    """Instantiate model by name with provided parameters."""
+    if model_name == "RandomForest":
+        return RandomForestClassifier(
+            n_estimators=params.get("n_estimators", 200),
+            max_depth=params.get("max_depth", None),
+            min_samples_leaf=params.get("min_samples_leaf", 1),
+            n_jobs=-1,
+            random_state=42,
+        )
+    if model_name == "CatBoost":
+        return CatBoostClassifier(
+            iterations=params.get("iterations", 300),
+            depth=params.get("depth", 6),
+            learning_rate=params.get("learning_rate", 0.1),
+            loss_function="Logloss",
+            verbose=False,
+            random_seed=42,
+        )
+    if model_name == "EBM":
+        return ExplainableBoostingClassifier(
+            interactions=params.get("interactions", 10),
+            max_bins=params.get("max_bins", 256),
+            max_leaves=params.get("max_leaves", 3),
+            learning_rate=params.get("learning_rate", 0.01),
+            outer_bags=params.get("outer_bags", 4),
+            inner_bags=params.get("inner_bags", 0),
+            random_state=42,
+        )
+    raise ValueError(f"Unknown model_name: {model_name}")
+
+
+def run_cv_training(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    sample_weight: np.ndarray,
+    model_name: str,
+    params: Dict,
+    n_splits: int = 5,
+) -> Dict:
+    """Run stratified CV, return OOF predictions, fitted models, and metrics."""
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    oof_pred_proba = np.zeros(len(y), dtype=float)
+    models = []
+
+    for train_idx, valid_idx in skf.split(X, y):
+        X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
+        y_train, y_valid = y[train_idx], y[valid_idx]
+        w_train = sample_weight[train_idx] if sample_weight is not None else None
+
+        model = build_model(model_name, params)
+
+        if model_name == "CatBoost":
+            model.fit(
+                X_train,
+                y_train,
+                sample_weight=w_train,
+                eval_set=(X_valid, y_valid),
+                verbose=False,
+            )
+        else:
+            model.fit(X_train, y_train, sample_weight=w_train)
+
+        proba_valid = model.predict_proba(X_valid)[:, 1]
+        oof_pred_proba[valid_idx] = proba_valid
+        models.append(model)
+
+    y_pred_05 = (oof_pred_proba >= 0.5).astype(int)
+    auc = roc_auc_score(y, oof_pred_proba)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y, y_pred_05, average="binary", zero_division=0
+    )
+    acc = accuracy_score(y, y_pred_05)
+
+    return {
+        "oof_pred_proba": oof_pred_proba,
+        "models": models,
+        "auc": auc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "accuracy": acc,
+    }
+
+
+def get_ebm_contributions(model: ExplainableBoostingClassifier, X: pd.DataFrame) -> np.ndarray:
+    """Return total logit contributions per sample for an EBM model."""
+    local_exp = model.explain_local(X)
+    scores = np.array(local_exp.data()["scores"])  # (n_samples, n_terms)
+    return scores.sum(axis=1)
+
+
+# ------------------------------------------------------------
+# Plotting helpers
+# ------------------------------------------------------------
+
+def plot_univariate_feature(df: pd.DataFrame, feature: str, target_col: str) -> None:
+    """Plot histogram/KDE and violin split by target for one feature."""
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+
+    sns.histplot(
+        data=df,
+        x=feature,
+        hue=target_col,
+        stat="density",
+        kde=True,
+        common_norm=False,
+        ax=ax[0],
+    )
+    ax[0].set_title(f"Histogram + KDE by {target_col}")
+
+    sns.violinplot(data=df, x=target_col, y=feature, ax=ax[1])
+    ax[1].set_title(f"Distribution by {target_col} (violin)")
+
+    plt.tight_layout()
+    st.pyplot(fig)
+
+
+def plot_pairwise_scatter_target(df: pd.DataFrame, feature1: str, feature2: str, target_col: str) -> None:
+    """Scatterplot for two features colored by target."""
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.scatterplot(data=df, x=feature1, y=feature2, hue=target_col, alpha=0.6, ax=ax)
+    ax.set_title(f"{feature1} vs {feature2} (colored by {target_col})")
+    plt.tight_layout()
+    st.pyplot(fig)
+
+
+def plot_pairwise_scatter_contrib_plotly(
+    df: pd.DataFrame,
+    feature1: str,
+    feature2: str,
+    contrib: np.ndarray,
+    title_suffix: str = "EBM contribution",
+) -> None:
+    """Plotly scatter for two features colored by contribution/score."""
+    fig = px.scatter(
+        df,
+        x=feature1,
+        y=feature2,
+        color=contrib,
+        color_continuous_scale="Viridis",
+        opacity=0.7,
+        labels={feature1: feature1, feature2: feature2, "color": title_suffix},
+        title=f"{feature1} vs {feature2} (colored by {title_suffix})",
+    )
     st.plotly_chart(fig, use_container_width=True)
-    st.download_button(
-        label=f"Download {name}",
-        data=fig.to_html().encode("utf-8"),
-        file_name=f"{name}.html",
-        mime="text/html",
+
+
+def plot_roc_curve(y_true: np.ndarray, y_score: np.ndarray) -> None:
+    """Plot ROC curve with AUC."""
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    auc_value = roc_auc_score(y_true, y_score)
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.plot(fpr, tpr, label=f"ROC curve (AUC = {auc_value:.3f})")
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Random baseline")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC Curve")
+    ax.legend(loc="lower right")
+
+    plt.tight_layout()
+    st.pyplot(fig)
+
+
+def plot_ebm_main_effect(model: ExplainableBoostingClassifier, feature: str) -> None:
+    """Plot 1D EBM main effect for a single feature."""
+    try:
+        global_exp = model.explain_global()
+        data = global_exp.data()
+        feature_names = list(model.feature_names_)
+        if feature not in feature_names:
+            st.info(f"EBM main effects do not contain feature: {feature}")
+            return
+        idx = feature_names.index(feature)
+        scores = np.array(data["scores"][idx])
+        bin_labels = np.array(data["bin_labels"][idx])
+
+        fig = go.Figure(
+            data=go.Scatter(
+                x=bin_labels,
+                y=scores,
+                mode="lines+markers",
+            )
+        )
+        fig.update_layout(
+            title=f"EBM main effect: {feature}",
+            xaxis_title=feature,
+            yaxis_title="logit contribution",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as exc:  # pragma: no cover - plotting fallback
+        st.info(f"Could not plot EBM main effect for {feature} because: {exc}")
+
+
+def plot_ebm_interaction_surface(
+    model: ExplainableBoostingClassifier, feature1: str, feature2: str
+) -> None:
+    """Plot 2D EBM interaction heatmap for a feature pair."""
+    try:
+        global_exp = model.explain_global()
+        data = global_exp.data()
+
+        target_scores = None
+        target_bins = None
+        target_name = None
+
+        for name, scores, bins in zip(data["names"], data["scores"], data["bin_labels"]):
+            if feature1 in name and feature2 in name and len(bins) == 2:
+                target_name = name
+                target_scores = np.array(scores)
+                target_bins = bins
+                break
+
+        if target_scores is None:
+            st.info(
+                "No interaction term found for this pair. Increase EBM interactions or pick a different pair."
+            )
+            return
+
+        x_bins = np.array(target_bins[0])
+        y_bins = np.array(target_bins[1])
+        z = target_scores if target_scores.shape[0] == len(x_bins) else target_scores.T
+
+        fig = go.Figure(
+            data=go.Heatmap(
+                x=x_bins,
+                y=y_bins,
+                z=z,
+                colorbar=dict(title="logit contribution"),
+            )
+        )
+        fig.update_layout(
+            title=f"EBM interaction surface: {target_name}",
+            xaxis_title=feature1,
+            yaxis_title=feature2,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as exc:  # pragma: no cover - plotting fallback
+        st.info(f"Could not plot EBM interaction surface because: {exc}")
+
+
+# ------------------------------------------------------------
+# Feature importance (SHAP / EBM)
+# ------------------------------------------------------------
+
+def compute_feature_importance_df(
+    model,
+    X: pd.DataFrame,
+    model_name: str,
+    max_samples: int = 2000,
+) -> Optional[pd.DataFrame]:
+    """Compute feature importance via SHAP (tree models) or global EBM scores."""
+    X_sample = X.sample(n=max_samples, random_state=42) if len(X) > max_samples else X
+
+    if model_name in ["RandomForest", "CatBoost"]:
+        if not HAS_SHAP:
+            return None
+        try:
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X_sample)
+            shap_vals = shap_values[1] if isinstance(shap_values, list) else shap_values
+            mean_abs = np.mean(np.abs(shap_vals), axis=0)
+            return (
+                pd.DataFrame({"feature": X_sample.columns, "importance": mean_abs})
+                .sort_values("importance", ascending=False)
+            )
+        except Exception:
+            return None
+
+    if model_name == "EBM":
+        try:
+            global_exp = model.explain_global(name="EBM")
+            data = global_exp.data()
+            feature_names = model.feature_names_
+            main_term_scores = data["scores"][: len(feature_names)]
+            mean_abs = np.array([np.mean(np.abs(s)) for s in main_term_scores])
+            return (
+                pd.DataFrame({"feature": feature_names, "importance": mean_abs})
+                .sort_values("importance", ascending=False)
+            )
+        except Exception:
+            return None
+
+    return None
+
+
+# ------------------------------------------------------------
+# RuleFit helper
+# ------------------------------------------------------------
+
+def run_rulefit(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    sample_weight: np.ndarray,
+    max_rules: int = 30,
+) -> Optional[pd.DataFrame]:
+    """Fit RuleFit to extract interaction rules; returns rules DataFrame."""
+    if not HAS_RULEFIT:
+        return None
+
+    rf_model = RuleFit(
+        tree_generator=RandomForestClassifier(
+            n_estimators=200,
+            max_depth=4,
+            random_state=42,
+            n_jobs=-1,
+        ),
+        max_rules=max_rules,
+        random_state=42,
     )
 
-
-@st.cache_data(show_spinner=False)
-def load_sources(
-    data_bytes: bytes | None,
-    data_name: str | None,
-    factor_bytes: bytes | None,
-    factor_name: str | None,
-    cfg_hash: str,
-    synthetic_rows: int,
-    synthetic_groups: int,
-) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, str]]:
-    factor_default = None
-    if data_bytes:
-        df_data = DataLoaderFactory.from_bytes(data_bytes, data_name or "uploaded.csv")
-        source = "uploaded"
-    else:
-        bundle = DataLoaderFactory.fallback_synthetic(rows=synthetic_rows, groups=synthetic_groups)
-        df_data = bundle.df_data
-        factor_default = bundle.df_factors
-        source = "synthetic"
-    if factor_bytes:
-        df_factors = DataLoaderFactory.from_bytes(factor_bytes, factor_name or "factors.csv")
-    else:
-        df_factors = factor_default if factor_default is not None else pd.DataFrame({"FactorName": ["target_main"]})
-    meta = {"hash": hash_pandas_frame(df_data), "source": source}
-    return df_data, df_factors, meta
+    rf_model.fit(X.values, y, feature_names=X.columns, sample_weight=sample_weight)
+    rules = rf_model.get_rules()
+    rules = rules[rules.coef != 0].sort_values("importance", ascending=False)
+    return rules
 
 
-@st.cache_data(show_spinner=False)
-def cache_split(
-    df: pd.DataFrame,
-    timestamp_col: str,
-    split_cfg: Dict,
-    mode: str,
-    group_col: str,
-    cfg_hash: str,
-):
-    splitter = TimeSplitService(timestamp_col=timestamp_col, mode=mode, cfg={**split_cfg, "group_col": group_col})
-    result = splitter.split(df)
-    return result.train, result.val, result.test, result.coverage, result.meta
+# ------------------------------------------------------------
+# Drift detection (Evidently)
+# ------------------------------------------------------------
+
+def _split_by_type(
+    df: pd.DataFrame, type_col: str
+) -> Dict[str, pd.DataFrame]:
+    """Split frame into TRAIN/VALID/TEST partitions using a TYPE column (case-insensitive)."""
+    split = {}
+    for part in ["TRAIN", "VALID", "TEST"]:
+        mask = df[type_col].astype(str).str.upper() == part
+        if mask.any():
+            split[part] = df.loc[mask].copy()
+    return split
 
 
-@st.cache_data(show_spinner=False)
-def cache_preprocess(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    test_df: pd.DataFrame,
+def run_drift_report(
+    reference_df: pd.DataFrame,
+    comparison_df: pd.DataFrame,
     target_col: str,
     feature_cols: List[str],
-    prep_cfg: Dict,
-    cfg_hash: str,
-):
-    pre = Preprocessor(prep_cfg)
-    train_subset = train_df[feature_cols + [target_col]]
-    val_subset = val_df[feature_cols + [target_col]]
-    test_subset = test_df[feature_cols + [target_col]]
-    artifacts = pre.fit(train_subset, target_col)
-    X_train = pre.transform(train_subset.drop(columns=[target_col]))
-    X_val = pre.transform(val_subset.drop(columns=[target_col]))
-    X_test = pre.transform(test_subset.drop(columns=[target_col]))
-    y_train = train_df[target_col]
-    y_val = val_df[target_col]
-    y_test = test_df[target_col]
-    artifact_dict = artifacts.__dict__ if artifacts else {}
-    return X_train, X_val, X_test, y_train, y_val, y_test, artifact_dict
-
-
-@st.cache_data(show_spinner=False)
-def cache_drift(
-    reference: pd.DataFrame,
-    comparison: pd.DataFrame,
-    features: List[str],
-    drift_cfg: Dict,
-    label: str,
-    cfg_hash: str,
-):
-    analyzer = DriftAnalyzer(drift_cfg)
-    report = analyzer.compare(reference=reference, comparison=comparison, features=features, label=label)
-    return report.table, report.coverage
-
-
-@st.cache_data(show_spinner=False)
-def cache_icc(
-    df: pd.DataFrame,
-    icc_cfg: Dict,
-    y_col: str,
-    yhat_col: str,
-    group_col: str,
-    time_col: str,
-    use_residuals: bool,
-    cfg_hash: str,
-):
-    analyzer = ICCAnalyzer(icc_cfg)
-    result = analyzer.evaluate(
-        df,
-        y_col=y_col,
-        yhat_col=yhat_col,
-        group_col=group_col,
-        time_col=time_col,
-        use_residuals=use_residuals,
+) -> str:
+    """Run Evidently data/target drift + quality report and return HTML."""
+    numerical = [c for c in feature_cols if pd.api.types.is_numeric_dtype(reference_df[c])]
+    categorical = [c for c in feature_cols if c not in numerical]
+    column_mapping = ColumnMapping(
+        target=target_col,
+        prediction=None,
+        numerical_features=numerical,
+        categorical_features=categorical,
     )
-    return result.icc_table, result.group_summary, result.residual_frame, result.default_metric
+    report = Report(
+        metrics=[
+            DataQualityPreset(),
+            DataDriftPreset(),
+            TargetDriftPreset(),
+        ]
+    )
+    report.run(reference_data=reference_df, current_data=comparison_df, column_mapping=column_mapping)
+    return report.get_html()
 
 
-@st.cache_data(show_spinner=False)
-def cache_tree_score(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
-    tree_cfg: Dict,
-    drift_table: pd.DataFrame,
-    cfg_hash: str,
-):
-    analyzer = TreeScoreAnalyzer(tree_cfg)
-    result = analyzer.score(X_train, y_train, X_val, y_val, drift_table)
-    return result.table, result.split_details, result.radar_payload
+# ------------------------------------------------------------
+# Streamlit App
+# ------------------------------------------------------------
 
+def main() -> None:
+    st.title("Tabular Binary Anomaly Analysis & Explanation")
 
-def main():
-    settings = load_config()
-    cfg = OmegaConf.to_container(settings.dump(), resolve=True)
-    cfg_hash = stable_hash(cfg)
-    if "probe_history" not in st.session_state:
-        st.session_state["probe_history"] = []
-    sidebar = st.sidebar
-    sidebar.header("Settings")
-    data_file = sidebar.file_uploader("Upload df_data (CSV/Feather)", type=["csv", "feather"])
-    factor_file = sidebar.file_uploader("Upload df_factors", type=["csv", "feather"])
-    default_rows = cfg["data"]["synthetic"].get("rows", 5000)
-    default_groups = cfg["data"]["synthetic"].get("groups", 10)
-    df_data, df_factors, meta = load_sources(
-        data_file.getvalue() if data_file else None,
-        data_file.name if data_file else None,
-        factor_file.getvalue() if factor_file else None,
-        factor_file.name if factor_file else None,
-        cfg_hash,
-        default_rows,
-        default_groups,
-    )
-    targets = df_factors["FactorName"].tolist()
-    target_col = sidebar.selectbox(
-        "Target column",
-        options=targets,
-        index=_default_index(targets, cfg["data"]["defaults"]["target"]),
-    )
-    columns_list = df_data.columns.tolist()
-    group_col = sidebar.selectbox(
-        "Group column",
-        options=columns_list,
-        index=_default_index(columns_list, cfg["data"]["defaults"]["group"]),
-    )
-    timestamp_col = sidebar.selectbox(
-        "Timestamp column",
-        options=columns_list,
-        index=_default_index(columns_list, cfg["data"]["defaults"]["timestamp"]),
-    )
-    df_data[timestamp_col] = pd.to_datetime(df_data[timestamp_col], errors="coerce")
-    feature_pool = [col for col in columns_list if col not in {target_col, group_col, timestamp_col}]
-    if not feature_pool:
-        st.error("No usable features. Please upload data with additional columns.")
-        st.stop()
-    selected_features = sidebar.multiselect("Feature subset", feature_pool, default=feature_pool)
-    if not selected_features:
-        selected_features = feature_pool
-    default_mode = cfg["data"]["split"].get("mode", "by_ratio")
-    split_mode = sidebar.radio(
-        "Split mode",
-        options=["by_ratio", "by_date"],
-        index=0 if default_mode == "by_ratio" else 1,
-    )
-    psi_slider = sidebar.slider(
-        "PSI risk threshold",
-        min_value=0.01,
-        max_value=0.5,
-        value=float(cfg["drift"]["thresholds"]["psi"]),
-        step=0.01,
-    )
-    ks_slider = sidebar.slider(
-        "KS risk threshold",
-        min_value=0.01,
-        max_value=0.5,
-        value=float(cfg["drift"]["thresholds"]["ks"]),
-        step=0.01,
-    )
-    if sidebar.button("Clear cache"):
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        sidebar.success("Cache cleared.")
-    sidebar.success("Cache enabled (st.cache_data)")
-    st.sidebar.markdown(f"**Dataset hash:** `{meta['hash'][:12]}` ({meta['source']})")
-    st.sidebar.markdown(f"**Cached plots:** {len(viz.SAVED_FIGURES)}")
+    # ---------------- Sidebar: Data Loading -------------------
+    st.sidebar.header("1. Data Loading")
 
-    split_cols = list(dict.fromkeys([timestamp_col, group_col, target_col] + selected_features))
-    dataset_view = df_data[split_cols].copy()
-    train_df, val_df, test_df, coverage, split_meta = cache_split(
-        dataset_view,
-        timestamp_col,
-        cfg["data"]["split"],
-        split_mode,
-        group_col,
-        cfg_hash,
-    )
-    (
-        X_train,
-        X_val,
-        X_test,
-        y_train,
-        y_val,
-        y_test,
-        prep_artifacts,
-    ) = cache_preprocess(train_df, val_df, test_df, target_col, selected_features, cfg["preprocess"], cfg_hash)
+    use_dir = st.sidebar.text_input("Working directory (optional)", value="")
+    selected_file_path = None
 
-    tabs = st.tabs(
+    if use_dir and os.path.isdir(use_dir):
+        all_files = os.listdir(use_dir)
+        valid_files = [
+            f
+            for f in all_files
+            if os.path.splitext(f)[1].lower()
+            in (".csv", ".feather", ".pkl", ".pickle")
+        ]
+        if valid_files:
+            selected_name = st.sidebar.selectbox(
+                "Choose file from directory", ["<None>"] + valid_files
+            )
+            if selected_name != "<None>":
+                selected_file_path = os.path.join(use_dir, selected_name)
+    elif use_dir:
+        st.sidebar.warning("Working directory not found or invalid.")
+
+    uploaded_file = st.sidebar.file_uploader(
+        "Or upload a file", type=["csv", "feather", "pkl", "pickle"]
+    )
+
+    df = None
+    data_source = None
+
+    if selected_file_path:
+        df = load_any_from_path(selected_file_path)
+        data_source = f"File: {selected_file_path}"
+    elif uploaded_file is not None:
+        df = load_any_from_upload(uploaded_file)
+        data_source = f"Uploaded: {uploaded_file.name}"
+
+    if df is None:
+        st.info("Select a working directory + file in the sidebar, or upload a CSV/Feather/Pickle file.")
+        return
+
+    # ---------------- Sidebar: Target & Features --------------
+    st.sidebar.header("2. Target & Features")
+
+    binary_cols = [
+        c
+        for c in df.columns
+        if df[c].nunique(dropna=True) <= 2 and df[c].dtype != "object"
+    ]
+    if "target" in df.columns:
+        default_target = "target"
+    elif binary_cols:
+        default_target = binary_cols[0]
+    else:
+        default_target = df.columns[0]
+
+    target_col = st.sidebar.selectbox(
+        "Target (binary)", df.columns, index=df.columns.get_loc(default_target)
+    )
+
+    feature_filter = st.sidebar.text_input("Feature name filter (substring)", value="")
+    auto_features = detect_feature_columns(df, target_col)
+
+    if feature_filter:
+        feature_options = [
+            c for c in df.columns if feature_filter.lower() in c.lower() and c != target_col
+        ]
+    else:
+        feature_options = [c for c in df.columns if c != target_col]
+
+    default_selection = [c for c in auto_features if c in feature_options]
+
+    feature_cols = st.sidebar.multiselect(
+        "Training feature columns",
+        options=feature_options,
+        default=default_selection,
+    )
+
+    if not feature_cols:
+        st.sidebar.warning("Select at least one feature for training.")
+        return
+
+    # ---------------- Sidebar: Class Weights & CV -------------
+    st.sidebar.header("3. Class Weight & CV")
+
+    w0 = st.sidebar.number_input("Weight for class 0", min_value=0.0, value=1.0, step=0.1)
+    w1 = st.sidebar.number_input("Weight for class 1", min_value=0.0, value=5.0, step=0.5)
+
+    n_splits = st.sidebar.slider("CV folds", min_value=3, max_value=10, value=5, step=1)
+
+    y = df[target_col].values.astype(int)
+    sample_weight = compute_class_weights(y, w0, w1)
+    X = df[feature_cols]
+
+    # ---------------- Sidebar: Model Settings -----------------
+    st.sidebar.header("4. Model Settings")
+
+    model_name = st.sidebar.selectbox("Base Model", ["RandomForest", "CatBoost", "EBM"])
+
+    model_params: Dict[str, float | int | None] = {}
+    if model_name == "RandomForest":
+        model_params["n_estimators"] = st.sidebar.slider("n_estimators", 50, 500, 200, 50)
+        max_depth_slider = st.sidebar.slider("max_depth (0 = None)", 0, 20, 10, 1)
+        model_params["max_depth"] = None if max_depth_slider == 0 else max_depth_slider
+        model_params["min_samples_leaf"] = st.sidebar.slider("min_samples_leaf", 1, 20, 1, 1)
+    elif model_name == "CatBoost":
+        model_params["iterations"] = st.sidebar.slider("iterations", 50, 1000, 300, 50)
+        model_params["depth"] = st.sidebar.slider("depth", 2, 10, 6, 1)
+        model_params["learning_rate"] = st.sidebar.number_input(
+            "learning_rate", 0.001, 1.0, 0.1, 0.01
+        )
+    elif model_name == "EBM":
+        model_params["interactions"] = st.sidebar.slider("interactions", 0, 50, 10, 1)
+        model_params["max_bins"] = st.sidebar.slider("max_bins", 16, 512, 256, 16)
+        model_params["max_leaves"] = st.sidebar.slider("max_leaves", 2, 10, 3, 1)
+        model_params["learning_rate"] = st.sidebar.number_input(
+            "learning_rate", 0.001, 0.1, 0.01, 0.001
+        )
+        model_params["outer_bags"] = st.sidebar.slider("outer_bags", 1, 10, 4, 1)
+        model_params["inner_bags"] = st.sidebar.slider("inner_bags", 0, 10, 0, 1)
+
+    # ---------------- Sidebar: Run CV -------------------------
+    st.sidebar.header("5. Run")
+    run_cv = st.sidebar.button("Run CV Training")
+
+    cv_results = None
+    final_models = None
+
+    if run_cv:
+        with st.spinner("Running cross-validation..."):
+            cv_results = run_cv_training(
+                X=X,
+                y=y,
+                sample_weight=sample_weight,
+                model_name=model_name,
+                params=model_params,
+                n_splits=n_splits,
+            )
+            final_models = cv_results["models"]
+        st.sidebar.success("CV finished!")
+
+    # ---------------- Main Tabs ------------------------------
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         [
-            "Data Explorer",
-            "Time Split & Prep",
-            "Drift Lab",
-            "Modeling",
-            "ICC Studio",
-            "Tree Score",
-            "Investigation",
-            "Reports & Artifacts",
+            "Data Overview",
+            "Univariate Dist.",
+            "Pairwise Relations",
+            "Model & CV",
+            "Rules / Interactions",
+            "Drift & Summary",
         ]
     )
 
-    with tabs[0]:
-        st.subheader("Data Explorer")
-        explorer_limit = cfg["data"]["explorer"]["max_rows"]
-        sample = maybe_sample_df(df_data, explorer_limit)
-        if sample.attrs.get("sampled"):
-            st.info(f"Showing sampled subset of {len(sample)} rows (full={len(df_data)}).")
-        st.dataframe(sample.head(500))
-        st.metric("Rows", len(df_data))
-        st.metric("Columns", len(df_data.columns))
-        desc = sample[selected_features].describe().T
-        st.dataframe(desc)
+    with tab1:
+        st.subheader("Data Overview")
+        st.write(f"**Data source:** {data_source}")
+        st.write(f"Rows: {df.shape[0]}, Columns: {df.shape[1]}")
+        st.write("Preview:")
+        st.dataframe(df.head())
 
-    with tabs[1]:
-        st.subheader("Splits & Preprocess")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Train rows", len(train_df))
-        c2.metric("Val rows", len(val_df))
-        c3.metric("Test rows", len(test_df))
-        st.caption(f"Split hash: {split_meta['hash'][:12]}")
-        st.dataframe(coverage)
-        st.json(prep_artifacts)
+        st.markdown("### Target distribution")
+        target_counts = df[target_col].value_counts().sort_index()
+        st.bar_chart(target_counts)
 
-    modeling_cfg = cfg["modeling"]
-    model_name = st.sidebar.selectbox("Model", ["lightgbm", "catboost", "ebm"])
-    params = modeling_cfg["models"].get(model_name, {})
-    with tabs[3]:
-        st.subheader("Modeling")
-        result = run_time_series_cv(X_train, y_train, cfg=modeling_cfg["cv"], model_name=model_name, model_params=params)
-        st.json(result.aggregate_metrics)
-        fi_df = result.feature_importance.reset_index()
-        fi_df.columns = ["feature", "importance"]
-        fi_chart = px.bar(fi_df.head(30), x="feature", y="importance", title="Feature importance (avg across folds)")
-        figure_block(fi_chart, "feature_importance")
-        final_model = result.final_model
-        val_holdout = {name: func(y_val, final_model.predict(X_val)) for name, func in METRIC_FNS.items()}
-        test_holdout = {name: func(y_test, final_model.predict(X_test)) for name, func in METRIC_FNS.items()}
-        st.metric("Holdout RMSE (val)", round(val_holdout["rmse"], 4))
-        st.metric("Holdout RMSE (test)", round(test_holdout["rmse"], 4))
-        st.json({"val": val_holdout, "test": test_holdout})
+        st.markdown("### Training feature columns")
+        st.write(feature_cols)
 
-    drift_cfg = copy.deepcopy(cfg["drift"])
-    drift_cfg["thresholds"]["psi"] = psi_slider
-    drift_cfg["thresholds"]["ks"] = ks_slider
-    drift_val, cov_val = cache_drift(
-        train_df[selected_features],
-        val_df[selected_features],
-        selected_features,
-        drift_cfg,
-        "Train vs Val",
-        cfg_hash,
-    )
-    drift_test, cov_test = cache_drift(
-        train_df[selected_features],
-        test_df[selected_features],
-        selected_features,
-        drift_cfg,
-        "Train vs Test",
-        cfg_hash,
-    )
+    with tab2:
+        st.subheader("Univariate Feature Distributions (by target)")
+        chosen_feature = st.selectbox("Select feature", feature_cols)
+        plot_univariate_feature(df, chosen_feature, target_col)
 
-    with tabs[2]:
-        st.subheader("Drift Lab")
-        st.markdown("**Train vs Val**")
-        st.dataframe(drift_val)
-        figure_block(viz.plot_drift_table(drift_val), "drift_val")
-        st.markdown("**Train vs Test**")
-        st.dataframe(drift_test)
-        figure_block(viz.plot_drift_table(drift_test), "drift_test")
-        feature_choice = st.selectbox("Visualize feature drift", selected_features, key="drift_feature")
-        combined = pd.concat(
-            [
-                train_df[[feature_choice]].assign(split="train"),
-                val_df[[feature_choice]].assign(split="val"),
-                test_df[[feature_choice]].assign(split="test"),
-            ],
-            axis=0,
-        )
-        dist_fig = viz.plot_distribution(combined, feature_choice, "split", f"{feature_choice} distribution by split")
-        figure_block(dist_fig, f"drift_distribution_{feature_choice}")
-        box_fig = viz.plot_box(combined, "split", feature_choice, title=f"{feature_choice} boxplot by split")
-        figure_block(box_fig, f"drift_box_{feature_choice}")
+    with tab3:
+        st.subheader("Pairwise Relations")
 
-    tree_cfg = cfg["tree_score"]
-    tree_table, tree_details, radar_payload = cache_tree_score(
-        X_train,
-        y_train,
-        X_val,
-        y_val,
-        tree_cfg,
-        drift_val,
-        cfg_hash,
-    )
+        col_left, col_right = st.columns(2)
+        with col_left:
+            feature1 = st.selectbox("Feature 1 (X-axis)", feature_cols, key="pair_f1")
+        with col_right:
+            feature2 = st.selectbox("Feature 2 (Y-axis)", feature_cols, key="pair_f2")
 
-    with tabs[5]:
-        st.subheader("Tree Score")
-        st.dataframe(tree_table.head(50))
-        figure_block(viz.plot_tree_score(tree_table, "delta_mse"), "tree_delta")
-        figure_block(viz.plot_radar(radar_payload), "tree_radar_app")
-
-    final_trainer = result.final_model
-    val_preds = final_trainer.predict(X_val)
-    test_preds = final_trainer.predict(X_test)
-    val_eval = val_df.assign(pred=val_preds)
-    val_eval["residual"] = val_eval[target_col] - val_eval["pred"]
-    test_eval = test_df.assign(pred=test_preds)
-    test_eval["residual"] = test_eval[target_col] - test_eval["pred"]
-    icc_cfg = cfg["icc"]
-    icc_val = cache_icc(val_eval, icc_cfg, target_col, "pred", group_col, timestamp_col, False, cfg_hash)
-
-    with tabs[4]:
-        st.subheader("ICC Studio")
-        icc_table, group_summary, residual_frame, default_metric = icc_val
-        st.dataframe(icc_table)
-        figure_block(viz.plot_icc_bars(icc_table), "icc_studio")
-        st.caption(f"Default ICC metric: {default_metric}. Assumes random effects per group and consistent timestamp cadence.")
-        scatter_fig = px.scatter(
-            val_eval,
-            x=target_col,
-            y="pred",
-            color=group_col,
-            title="y vs ŷ (colored by group)",
-        )
-        figure_block(scatter_fig, "icc_pred_vs_actual")
-        resid_fig = px.line(
-            val_eval.sort_values(timestamp_col),
-            x=timestamp_col,
-            y="residual",
-            color=group_col,
-            title="Residual vs time",
-        )
-        figure_block(resid_fig, "icc_residual_time")
-        group_fig = px.bar(group_summary, x=group_col, y="mean_value", error_y="ci95", title="Group means ± CI")
-        figure_block(group_fig, "icc_group_ci")
-
-    with tabs[6]:
-        st.subheader("Investigation")
-        probe_choice = st.selectbox("Probe", ProbeRegistry.available())
-        if probe_choice == "residual_by_time":
-            payload = {
-                "df": val_eval,
-                "time_col": timestamp_col,
-                "residual_col": "residual",
-                "bins": cfg["probes"]["bins"],
-            }
-        elif probe_choice == "residual_by_group":
-            payload = {
-                "df": val_eval,
-                "group_col": group_col,
-                "residual_col": "residual",
-                "top_n": cfg["probes"].get("top_groups", 10),
-            }
-        elif probe_choice == "importance_stability":
-            payload = {
-                "feature_importance": result.feature_importance,
-                "permutation": result.permutation_importance,
-                "jaccard": result.topk_stability,
-            }
-        elif probe_choice == "drift_importance_matrix":
-            payload = {"drift_table": drift_val, "importance": result.feature_importance}
-        elif probe_choice == "icc_group_stability":
-            payload = {"group_summary": group_summary, "icc_table": icc_table}
+        if feature1 == feature2:
+            st.warning("Please choose two different features.")
         else:
-            payload = {"df": df_data, "feature": selected_features[0], "target": target_col}
-        probe_result = ProbeRegistry.run(probe_choice, **payload)
-        st.markdown(probe_result.summary_md)
-        for fig in probe_result.figs:
-            figure_block(fig, f"probe_{probe_choice}")
-        for name, table in probe_result.tables.items():
-            st.dataframe(table)
-        history = st.session_state.setdefault("probe_history", [])
-        history.append({"title": probe_result.title, "summary": probe_result.summary_md, "tags": probe_result.tags})
-        st.session_state["probe_history"] = history[-10:]
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("#### Colored by target (0/1)")
+                plot_pairwise_scatter_target(df, feature1, feature2, target_col)
 
-    with tabs[7]:
-        st.subheader("Reports & Artifacts")
-        probe_notes = st.session_state.get("probe_history", [])
-        report_payload = {
-            "config": cfg,
-            "metrics": result.aggregate_metrics,
-            "drift_risks": drift_val.to_dict("records"),
-            "icc": icc_table.to_dict("records"),
-            "probes": probe_notes,
-        }
-        st.download_button(
-            "Download report (JSON)",
-            data=json.dumps(report_payload, indent=2).encode("utf-8"),
-            file_name="report.json",
-            mime="application/json",
-        )
-        md_lines = [
-            "# Temporal Regression Lab Report",
-            "## Metrics",
-        ]
-        for metric, value in result.aggregate_metrics.items():
-            md_lines.append(f"- **{metric.upper()}**: {value:.4f}")
-        md_lines.append("## Drift Highlights (Train→Val)")
-        for row in drift_val.head(10).to_dict("records"):
-            md_lines.append(f"- {row['feature']}: PSI={row.get('psi', 0):.3f} ({row['risk_level']})")
-        md_lines.append("## ICC Summary")
-        for _, row in icc_table.iterrows():
-            md_lines.append(f"- {row.get('Type', row.get('targets', 'ICC'))}: {row.get('ICC', 0):.3f}")
-        if probe_notes:
-            md_lines.append("## Probe Highlights")
-            for note in probe_notes[-5:]:
-                md_lines.append(f"- **{note['title']}** ({', '.join(note['tags'])}): {note['summary']}")
-        md_report = "\n".join(md_lines)
-        html_report = "<html><body>" + "</br>".join(md_lines) + "</body></html>"
-        st.download_button(
-            "Download report (Markdown)",
-            data=md_report.encode("utf-8"),
-            file_name="report.md",
-            mime="text/markdown",
-        )
-        st.download_button(
-            "Download report (HTML)",
-            data=html_report.encode("utf-8"),
-            file_name="report.html",
-            mime="text/html",
-        )
-        st.write("Artifacts stored in `artifacts/plots`.")
+            with col_b:
+                st.markdown("#### EBM-based interaction views (Plotly)")
+
+                if cv_results is not None and model_name == "EBM":
+                    ebm_model = final_models[0]
+
+                    ebm_contrib = get_ebm_contributions(ebm_model, X)
+                    st.markdown("**Sample scatter (color = EBM total score)**")
+                    plot_pairwise_scatter_contrib_plotly(
+                        df, feature1, feature2, ebm_contrib, title_suffix="EBM total score"
+                    )
+
+                    st.markdown("**EBM interaction surface (2D heatmap)**")
+                    plot_ebm_interaction_surface(ebm_model, feature1, feature2)
+
+                    with st.expander("EBM main effects (1D) for selected features"):
+                        st.markdown(f"**Main effect: {feature1}**")
+                        plot_ebm_main_effect(ebm_model, feature1)
+                        st.markdown(f"**Main effect: {feature2}**")
+                        plot_ebm_main_effect(ebm_model, feature2)
+
+                else:
+                    st.info("Select EBM in the sidebar and run CV to see interaction plots.")
+
+    with tab4:
+        st.subheader("Model & Cross-Validation Performance")
+
+        if cv_results is None:
+            st.info("Click 'Run CV Training' in the sidebar to start.")
+        else:
+            st.markdown(f"**Model:** {model_name}")
+
+            metrics_df = pd.DataFrame(
+                {
+                    "metric": ["AUC", "Accuracy", "Precision", "Recall", "F1"],
+                    "value": [
+                        cv_results["auc"],
+                        cv_results["accuracy"],
+                        cv_results["precision"],
+                        cv_results["recall"],
+                        cv_results["f1"],
+                    ],
+                }
+            )
+            st.markdown("### Overall metrics (threshold = 0.5 baseline)")
+            st.table(metrics_df.style.format({"value": "{:.4f}"}))
+
+            st.markdown("### ROC Curve")
+            plot_roc_curve(y, cv_results["oof_pred_proba"])
+
+            threshold = st.slider("Decision threshold for class 1", 0.0, 1.0, 0.5, 0.01)
+            y_pred = (cv_results["oof_pred_proba"] >= threshold).astype(int)
+            cm = confusion_matrix(y, y_pred)
+
+            st.markdown("### Confusion Matrix")
+            cm_df = pd.DataFrame(cm, index=["True 0", "True 1"], columns=["Pred 0", "Pred 1"])
+            st.dataframe(cm_df)
+
+            st.markdown("### Out-of-fold prediction distribution")
+            fig, ax = plt.subplots(figsize=(6, 4))
+            sns.histplot(cv_results["oof_pred_proba"], bins=50, kde=True, ax=ax)
+            ax.axvline(threshold, color="red", linestyle="--")
+            ax.set_title("OOF predicted probability (class=1)")
+            st.pyplot(fig)
+
+            st.markdown("### Text classification report")
+            report = classification_report(y, y_pred, output_dict=False)
+            st.text(report)
+
+            st.markdown("### Feature importance ranking (SHAP / EBM)")
+            compute_imp_btn = st.button("Compute feature importance")
+
+            if compute_imp_btn:
+                model_for_imp = cv_results["models"][0]
+                with st.spinner("Computing feature importance..."):
+                    imp_df = compute_feature_importance_df(model_for_imp, X, model_name=model_name)
+                if imp_df is None or imp_df.empty:
+                    if model_name in ["RandomForest", "CatBoost"] and not HAS_SHAP:
+                        st.warning("Install shap to enable tree model feature importance.")
+                    else:
+                        st.info("Could not compute feature importance or result is empty.")
+                else:
+                    st.dataframe(imp_df)
+                    fig, ax = plt.subplots(figsize=(6, max(4, len(imp_df) * 0.3)))
+                    sns.barplot(data=imp_df, x="importance", y="feature", ax=ax)
+                    ax.set_title("Feature importance ranking")
+                    plt.tight_layout()
+                    st.pyplot(fig)
+
+    with tab5:
+        st.subheader("Rule-based Interaction Mining (RuleFit)")
+
+        if not HAS_RULEFIT:
+            st.warning("Install rulefit (pip install rulefit) to enable this tab.")
+        else:
+            max_rules = st.number_input("Max rules", min_value=10, max_value=200, value=30, step=10)
+            run_rules_btn = st.button("Run RuleFit")
+
+            if run_rules_btn:
+                with st.spinner("Running RuleFit..."):
+                    rules_df = run_rulefit(X, y, sample_weight, max_rules=int(max_rules))
+                if rules_df is None or rules_df.empty:
+                    st.info("No rules extracted or all coefficients are zero.")
+                else:
+                    st.markdown("### Top rules")
+                    st.dataframe(rules_df.head(50))
+
+    with tab6:
+        st.subheader("Drift & Summary (Evidently)")
+        if not HAS_EVIDENTLY:
+            st.warning("Install evidently to enable drift reporting (pip install 'evidently>=0.4,<0.5').")
+            return
+
+        type_candidates = [c for c in df.columns if c.lower() == "type"]
+        if not type_candidates:
+            st.info("Provide a TYPE column with TRAIN/VALID/TEST to run drift checks.")
+            return
+
+        type_col = type_candidates[0]
+        splits = _split_by_type(df, type_col)
+        if "TRAIN" not in splits:
+            st.warning("TYPE column found, but no TRAIN rows present.")
+            return
+
+        reference_choice = st.selectbox("Reference split", options=list(splits.keys()), index=0)
+        comparison_options = [k for k in splits.keys() if k != reference_choice]
+        if not comparison_options:
+            st.info("Need at least one comparison split besides the reference.")
+            return
+
+        comparison_choice = st.selectbox("Comparison split", options=comparison_options, index=0)
+        sample_limit = st.slider("Max rows per split (sampling for speed)", 100, 20000, 5000, 100)
+
+        ref_df = splits[reference_choice]
+        cur_df = splits[comparison_choice]
+        if len(ref_df) > sample_limit:
+            ref_df = ref_df.sample(sample_limit, random_state=42)
+        if len(cur_df) > sample_limit:
+            cur_df = cur_df.sample(sample_limit, random_state=42)
+
+        run_report = st.button("Run drift report")
+        if run_report:
+            with st.spinner("Generating Evidently report..."):
+                try:
+                    html = run_drift_report(
+                        reference_df=ref_df,
+                        comparison_df=cur_df,
+                        target_col=target_col,
+                        feature_cols=feature_cols,
+                    )
+                    st.components.v1.html(html, height=900, scrolling=True)
+                except Exception as exc:  # pragma: no cover - runtime safety
+                    st.error(f"Failed to build drift report: {exc}")
 
 
 if __name__ == "__main__":
