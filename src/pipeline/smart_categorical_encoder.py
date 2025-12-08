@@ -57,6 +57,16 @@ class _BaseColumnEncoder:
     ``transform``. To expose a custom encoder through SmartCategoricalEncoder,
     inherit from this base class and register it via
     ``SmartCategoricalEncoder.register_encoder('name', CustomEncoder)``.
+
+    Example
+    -------
+    >>> class ConstantEncoder(_BaseColumnEncoder):
+    ...     def fit(self, series, y=None):
+    ...         self.feature_names_ = [f"{self.column}__constant"]
+    ...         return self
+    ...     def transform(self, series):
+    ...         return pd.DataFrame(0.0, index=series.index, columns=self.feature_names_)
+    >>> SmartCategoricalEncoder.register_encoder('constant', ConstantEncoder)
     """
 
     def __init__(self, column: str) -> None:
@@ -79,6 +89,11 @@ class _OneHotColumnEncoder(_BaseColumnEncoder):
     Usage: set ``strategy='onehot'`` or map ``{'col': 'onehot'}`` when
     instantiating SmartCategoricalEncoder. Optional params: ``drop`` (for
     example ``'if_binary'``) forwarded via ``params['onehot']``.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'city': 'onehot'})
+    >>> encoder.fit(df[['city']], target)
     """
     def __init__(self, column: str, drop: Optional[str] = None) -> None:
         super().__init__(column)
@@ -103,6 +118,11 @@ class _OrdinalColumnEncoder(_BaseColumnEncoder):
     Usage: choose ``strategy='ordinal'`` or per-column mapping.
     Works best when approximate ordering is acceptable or downstream models
     (tree ensembles) can handle arbitrary integer labels.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'device': 'ordinal'})
+    >>> encoder.fit(df[['device']], target=None)
     """
     def __init__(self, column: str) -> None:
         super().__init__(column)
@@ -125,6 +145,11 @@ class _TargetMeanEncoder(_BaseColumnEncoder):
 
     Usage: ``strategy='target'`` (requires a target vector). Configure
     smoothing/noise via ``params['target']`` for SmartCategoricalEncoder.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'city': 'target'})
+    >>> encoder.fit(df[['city']], target)
     """
     def __init__(self, column: str, smoothing: float = 10.0, noise: float = 0.0) -> None:
         super().__init__(column)
@@ -161,6 +186,11 @@ class _LeaveOneOutEncoder(_BaseColumnEncoder):
     Usage: ``strategy='leave_one_out'`` with a supplied ``y`` series. Helpful
     when leakage must be minimized; noise and epsilon are set via
     ``params['leave_one_out']``.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'city': 'leave_one_out'})
+    >>> encoder.fit(df[['city']], target)
     """
     def __init__(self, column: str, noise: float = 0.0, epsilon: float = 1e-6) -> None:
         super().__init__(column)
@@ -203,6 +233,11 @@ class _CatBoostEncoder(_BaseColumnEncoder):
 
     Usage: ``strategy='catboost'`` with a target vector. Parameters ``prior``,
     ``noise`` and ``random_state`` can be passed via ``params['catboost']``.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'city': 'catboost'})
+    >>> encoder.fit(df[['city']], target)
     """
     def __init__(
         self,
@@ -251,6 +286,11 @@ class _JamesSteinEncoder(_BaseColumnEncoder):
 
     Usage: ``strategy='james_stein'`` (requires ``y``). Control the
     ``prior_weight`` through ``params['james_stein']``.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'region': 'james_stein'})
+    >>> encoder.fit(df[['region']], regression_target)
     """
     def __init__(self, column: str, prior_weight: float = 5.0) -> None:
         super().__init__(column)
@@ -284,6 +324,11 @@ class _WoEEncoder(_BaseColumnEncoder):
 
     Usage: ``strategy='woe'`` with a binary target. Adjust Laplace smoothing
     through ``params['woe']['regularization']``.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'segment': 'woe'})
+    >>> encoder.fit(df[['segment']], binary_target)
     """
     def __init__(self, column: str, regularization: float = 1.0) -> None:
         super().__init__(column)
@@ -328,6 +373,11 @@ class _CountFrequencyEncoder(_BaseColumnEncoder):
     Usage: choose ``strategy='count'`` or ``strategy='frequency'``. The
     ``normalize`` flag is set automatically based on the requested strategy,
     but can be overridden via ``params`` if needed.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'sku': 'frequency'})
+    >>> encoder.fit(df[['sku']], target=None)
     """
     def __init__(self, column: str, normalize: bool = False) -> None:
         super().__init__(column)
@@ -351,6 +401,11 @@ class _HashingEncoder(_BaseColumnEncoder):
 
     Usage: set ``strategy='hashing'`` (no target required). Control the output
     dimension via ``params['hashing']['n_features']``.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'user_id': 'hashing'})
+    >>> encoder.fit(df[['user_id']], target=None)
     """
     def __init__(self, column: str, n_features: int = 32) -> None:
         super().__init__(column)
@@ -373,6 +428,11 @@ class _BinaryEncoder(_BaseColumnEncoder):
 
     Usage: ``strategy='binary'`` for mid-cardinality unsupervised columns.
     Automatically determines the number of required bits during ``fit``.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'campaign': 'binary'})
+    >>> encoder.fit(df[['campaign']], target=None)
     """
     def __init__(self, column: str) -> None:
         super().__init__(column)
@@ -403,6 +463,11 @@ class _HelmertEncoder(_BaseColumnEncoder):
 
     Usage: ``strategy='helmert'``; requires at least two observed categories
     and is typically used for ANOVA-style models.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'treatment': 'helmert'})
+    >>> encoder.fit(df[['treatment']], target=None)
     """
     def __init__(self, column: str) -> None:
         super().__init__(column)
@@ -440,6 +505,11 @@ class _RareCategoryEncoder(_BaseColumnEncoder):
     Usage: ``strategy='rare_grouping'`` and specify ``min_freq`` via
     ``params['rare_grouping']['min_freq']``. Often combined with a follow-up
     One-Hot or target encoder.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'sku': 'rare_grouping'})
+    >>> encoder.fit(df[['sku']], target=None)
     """
     def __init__(self, column: str, min_freq: float = 0.01) -> None:
         super().__init__(column)
@@ -471,6 +541,11 @@ class _EntityEmbeddingEncoder(_BaseColumnEncoder):
 
     Usage: ``strategy='embedding'`` (unsupervised). The ``embedding_dim`` and
     ``random_state`` options are configurable under ``params['embedding']``.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'artist': 'embedding'})
+    >>> encoder.fit(df[['artist']], target=None)
     """
     def __init__(self, column: str, embedding_dim: int = 4, random_state: Optional[int] = None) -> None:
         super().__init__(column)
@@ -514,6 +589,11 @@ class _MultiHashEmbeddingEncoder(_BaseColumnEncoder):
     Usage: ``strategy='multi_hash'``. Tune ``n_hashes``, ``hash_dim`` and
     ``embedding_dim`` via ``params['multi_hash']``. Optionally uses the target
     to nudge embeddings during ``fit``.
+
+    Example
+    -------
+    >>> encoder = SmartCategoricalEncoder(strategy={'user_id': 'multi_hash'})
+    >>> encoder.fit(df[['user_id']], target)
     """
     def __init__(
         self,
@@ -568,7 +648,15 @@ ColumnStrategy = Union[str, Dict[str, str]]
 
 
 class SmartCategoricalEncoder(BaseEstimator, TransformerMixin):
-    """Flexible categorical encoder with automatic strategy discovery."""
+    """Flexible categorical encoder with automatic strategy discovery.
+
+    Example
+    -------
+    >>> cat_cols = ['city', 'device']
+    >>> encoder = SmartCategoricalEncoder(strategy='auto', random_state=13)
+    >>> encoded = encoder.fit_transform(df[cat_cols], target)
+    >>> encoded.head()
+    """
 
     BUILTIN_ENCODERS: ClassVar[Dict[str, Type[_BaseColumnEncoder]]] = {
         "onehot": _OneHotColumnEncoder,
