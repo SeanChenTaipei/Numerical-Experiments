@@ -161,3 +161,114 @@ assert loaded.get_feature_names() == encoder.get_feature_names()
 - **Rare categories not grouped** - raise `params["general"]["rare_threshold"]` or pre-group with domain rules.
 
 Happy encoding!
+---
+
+# Feature Selection POC Framework
+
+A reusable Python framework for regression feature-selection POCs with auditable scorebooks, feature families, graph artifacts, model-based pruning, tail-aware metrics, and domain-expert rescue workflows.
+
+## Suitable Use Cases
+
+- Bell-shaped, skewed, tail-heavy, or moderately outlier-sensitive regression targets.
+- High-dimensional tabular feature spaces that need staged reduction.
+- Feature review workflows where domain experts need removal reasons, redundancy families, and rescue candidates.
+- POCs that may later sync feature lineage to Neo4j or another knowledge graph engine.
+
+For extremely sparse spike targets, reuse the quality/scorebook/graph stages but replace the modeling stage with anomaly detection, rare-event two-stage modeling, ranking, one-class learning, or retrieval.
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+## Quick Start
+
+```python
+from feature_selection_poc.config import FeatureSelectionConfig
+from feature_selection_poc.data import make_regression_poc_dataset
+from feature_selection_poc.pipeline import FeatureSelectionPipeline
+
+X, y, metadata = make_regression_poc_dataset(target_type="skewed")
+config = FeatureSelectionConfig()
+pipeline = FeatureSelectionPipeline(config)
+result = pipeline.fit_select(X, y, feature_metadata=metadata)
+
+print(result.selected_features)
+pipeline.save_artifacts(result, output_dir="outputs/demo_run")
+repo = pipeline.sync_feature_graph(result.feature_graph, backend="local")
+print(repo.query_feature_neighbors(result.selected_features[0], max_depth=2))
+```
+
+## Notebook
+
+Run the walkthrough:
+
+```bash
+jupyter notebook notebooks/01_feature_selection_pipeline_walkthrough.ipynb
+```
+
+The notebook covers setup, synthetic/public-data fallback, metadata, configuration, quality filters, scorebook, feature family graph, local/Neo4j graph repository usage, model-based pruning, tail analysis, domain rescue, and artifact export.
+
+## Pipeline API
+
+- `fit_select(X_train, y_train, feature_metadata=None)`
+- `transform(X)` / `fit_transform(X, y, metadata)`
+- `save_artifacts(result, output_dir)` / `load_artifacts(output_dir)`
+- `export_scorebook(result, path)`
+- `export_feature_graph(result, output_dir)`
+- `sync_feature_graph(result.feature_graph, backend="local|networkx|neo4j")`
+- `query_feature_graph(feature_name, max_depth)`
+- `export_to_neo4j(result)`
+- `rescue_features(result, feature_names)`
+- `rerun_with_rescued_features(X, y, rescued_features)`
+
+## Output Artifacts
+
+- `selected_features.csv` and `removed_features.csv`
+- `feature_scorebook.parquet`
+- `feature_metadata.parquet`
+- `feature_family.parquet`
+- `feature_graph_nodes.csv` and `feature_graph_edges.csv`
+- `selection_history.json`
+- `model_evaluation.json`
+- `graph_backend_sync_report.json`
+- `summary_report.md`
+
+## Extending Models, Scorers, Selectors, and Graph Backends
+
+- Add a model adapter by implementing the `RegressionModelAdapter` protocol and registering it in `feature_selection_poc.models.create_model_adapter`.
+- Add a scorer by following `ScorebookBuilder` and writing normalized columns into the scorebook.
+- Add a selector/pruner by following `IterativeImportancePruningStrategy`.
+- Add a graph backend by implementing `FeatureGraphRepository` and registering it in `feature_selection_poc.integrations.create_graph_repository`.
+
+## Neo4j Integration
+
+Set `GraphBackendConfig(backend="neo4j", neo4j_uri="bolt://localhost:7687", neo4j_user="neo4j", neo4j_password="...")` and call `pipeline.export_to_neo4j(result)`. Schema labels, relationship types, constraints, and example Cypher templates live in `feature_selection_poc/graph/graph_schema.py` and `feature_selection_poc/graph/cypher_templates.py`.
+
+## Feature Graph Queries
+
+Local, NetworkX, and Neo4j repositories share a common interface:
+
+```python
+repo.query_feature_neighbors("f_001", max_depth=2)
+repo.query_family_members("corr_family_0001")
+```
+
+## Domain Rescue
+
+Use the scorebook, graph neighbors, and tail scores to choose candidate features, then rerun:
+
+```python
+rescued = ["f_007", "f_dup_002"]
+result = pipeline.rescue_features(result, rescued)
+metrics = pipeline.rerun_with_rescued_features(X, y, rescued)
+```
+
+## FAQ
+
+**Can this handle hundreds of thousands of features?** Use staged filtering, top-k caps, sampled MI/correlation, metadata blocking, and edge caps before model pruning.
+
+**Do I need Neo4j?** No. The local repository writes node and edge tables that are easy to visualize or load later.
+
+**Where is the architecture design?** See `docs/feature_selection_poc_design.md`.
